@@ -156,6 +156,10 @@ module cpu #(
     logic [31:0] if_pc;
     logic [31:0] if_pc_current;
     wire [31:0] if_instr;
+    logic if_pred_taken;
+    logic [31:0] if_pred_target;
+    logic if_pred_hit;
+    logic [1:0] if_pred_counter;
 
     assign if_instr = fetch_read;
 
@@ -172,6 +176,11 @@ module cpu #(
     logic signed [31:0] id_simm16;
     logic signed [31:0] id_simm21;
     logic signed [31:0] id_simm26;
+    logic [31:0] id_next_pc;
+    logic id_pred_taken;
+    logic [31:0] id_pred_target;
+    logic id_pred_hit;
+    logic [1:0] id_pred_counter;
 
     assign id_opcode = opcode_t'(id_instr[31:26]);
     assign id_reg_addr = id_instr[25:21];
@@ -184,6 +193,7 @@ module cpu #(
     assign id_simm16 = {{16{id_imm16[15]}}, id_imm16};
     assign id_simm21 = {{11{id_imm21[20]}}, id_imm21};
     assign id_simm26 = {{6{id_imm26[25]}}, id_imm26};
+    assign id_next_pc = id_pc + 32'd4;
 
     logic id_branch_always;
     logic id_branch_if_eq;
@@ -203,7 +213,7 @@ module cpu #(
         id_signed_compare = (id_opcode == OP_BLT) || (id_opcode == OP_BGE);
 
         case (id_opcode)
-            OP_B, OP_BR, OP_BL, OP_BLR, OP_ECALL, OP_ERET: id_branch_always = 1;
+            OP_B, OP_BR, OP_BL, OP_BLR: id_branch_always = 1;
             OP_BEQ: id_branch_if_eq = 1;
             OP_BNE: id_branch_if_ne = 1;
             OP_BLT, OP_BLTU: id_branch_if_lt = 1;
@@ -240,7 +250,7 @@ module cpu #(
         id_result_compare = 0;
         id_result_csr = 0;
         id_compare_signed = 0;
-        id_static_result = id_pc + 4;
+        id_static_result = id_next_pc;
 
         case (id_opcode)
             OP_LB, OP_LBU, OP_LH, OP_LHU, OP_LW: id_load = 1;
@@ -351,6 +361,14 @@ module cpu #(
     logic ex_branch_if_ge;
     logic ex_signed_compare;
     logic [31:0] ex_branch_target;
+    logic ex_system_branch;
+    logic ex_jump_reg0;
+    logic ex_jump_reg1;
+    logic [31:0] ex_next_pc;
+    logic ex_pred_taken;
+    logic [31:0] ex_pred_target;
+    logic ex_pred_hit;
+    logic [1:0] ex_pred_counter;
 
     logic should_take_branch;
     logic [31:0] branch_target;
@@ -862,8 +880,44 @@ module cpu #(
         end
     end
 
-    assign should_take_branch = take_data_fault || take_interrupt || take_exception || should_wait || wake_from_interrupt || ex_branch_always ||
-        (branch_eq ? ex_branch_if_eq : ex_branch_if_ne) || (branch_lt ? ex_branch_if_lt : ex_branch_if_ge);
+    logic ex_branch;
+    logic branch_condition;
+    logic [31:0] branch_destination;
+    logic target_correct;
+    logic mispredict;
+
+    assign ex_branch = ex_branch_always || ex_branch_if_eq || ex_branch_if_ne || ex_branch_if_lt || ex_branch_if_ge;
+    assign branch_condition = ex_branch_always || (branch_eq ? ex_branch_if_eq : ex_branch_if_ne) || (branch_lt ? ex_branch_if_lt : ex_branch_if_ge);
+    assign branch_destination = ex_jump_reg0 ? branch_reg0 : (ex_jump_reg1 ? branch_reg1 : ex_branch_target);
+    assign target_correct = ex_jump_reg0 ? branch_reg0 == ex_pred_target : (ex_jump_reg1 ? branch_reg1 == ex_pred_target : ex_branch_target == ex_pred_target);
+    assign mispredict = ex_pred_taken ? !(branch_condition && target_correct) : branch_condition;
+    assign should_take_branch = take_data_fault || take_interrupt || take_exception || should_wait || wake_from_interrupt || ex_system_branch || mispredict;
+
+    logic predict_taken;
+    logic [31:0] predict_target;
+    logic predict_hit;
+    logic [1:0] predict_counter;
+
+    branch_predictor predictor0 (
+        .clk(clk),
+        .rst(rst),
+        .fetch_pc(if_pc),
+        .fetch_advance(!bus_stall && !should_take_branch && !halted && !hazard_stall && !alu_stall && !waiting_for_interrupt),
+        .predict_taken(predict_taken),
+        .predict_target(predict_target),
+        .predict_hit(predict_hit),
+        .predict_counter(predict_counter),
+        .redirect(!bus_stall && should_take_branch),
+        .update(!bus_stall && ex_branch && !take_data_fault && !take_interrupt && !take_exception),
+        .update_pc(ex_pc),
+        .update_taken(branch_condition),
+        .update_target(branch_destination),
+        .update_call((ex_opcode == OP_BL || ex_opcode == OP_BLR) && ex_reg_addr == 5'd1),
+        .update_return(ex_jump_reg0 && ex_reg_addr == 5'd1),
+        .update_hit(ex_pred_hit),
+        .update_counter(ex_pred_counter),
+        .return_address(ex_next_pc)
+    );
 
     logic compare_less;
 
@@ -871,7 +925,7 @@ module cpu #(
     assign ex_result = ex_result_alu ? alu_result : (ex_result_compare ? {31'b0, compare_less} : (ex_result_csr ? csr_read : ex_static_result));
 
     always_comb begin
-        branch_target = waiting_for_interrupt ? if_pc : ex_branch_target;
+        branch_target = waiting_for_interrupt ? if_pc : (branch_condition ? branch_destination : ex_next_pc);
         should_halt = 0;
         ex_addr = 0;
 
@@ -879,11 +933,8 @@ module cpu #(
             OP_LB, OP_LBU, OP_LH, OP_LHU, OP_LW, OP_SB, OP_SH, OP_SW:
                 ex_addr = ex_reg1_fwd + ex_simm16;
 
-            OP_BR: branch_target = ex_reg0_fwd;
-            OP_BLR: branch_target = ex_reg1_fwd;
             OP_ECALL: branch_target = csr_vector;
             OP_ERET: branch_target = csr_epc;
-            OP_WFI: branch_target = ex_pc + 32'd4;
             OP_HLT: should_halt = 1;
         endcase
 
@@ -997,10 +1048,18 @@ module cpu #(
 
             if_pc <= 0;
             if_pc_current <= 0;
+            if_pred_taken <= 0;
+            if_pred_target <= 0;
+            if_pred_hit <= 0;
+            if_pred_counter <= 0;
 
             id_pc <= 0;
             id_instr <= 0;
             id_fetch_fault <= 0;
+            id_pred_taken <= 0;
+            id_pred_target <= 0;
+            id_pred_hit <= 0;
+            id_pred_counter <= 0;
 
             ex_pc <= 0;
             ex_instr <= 0;
@@ -1029,6 +1088,14 @@ module cpu #(
             ex_branch_if_ge <= 0;
             ex_signed_compare <= 0;
             ex_branch_target <= 0;
+            ex_system_branch <= 0;
+            ex_jump_reg0 <= 0;
+            ex_jump_reg1 <= 0;
+            ex_next_pc <= 0;
+            ex_pred_taken <= 0;
+            ex_pred_target <= 0;
+            ex_pred_hit <= 0;
+            ex_pred_counter <= 0;
             ex_fwd_mem <= 0;
             ex_fwd_wb <= 0;
             ex_branch_fwd_mem <= 0;
@@ -1067,26 +1134,38 @@ module cpu #(
             if (should_take_branch) begin
                 if_pc <= branch_target;
                 if_pc_current <= branch_target;
+                if_pred_taken <= 0;
             end else if (halted) begin
                 if_pc <= 0;
                 if_pc_current <= 0;
+                if_pred_taken <= 0;
             end else if (hazard_stall || alu_stall || waiting_for_interrupt) begin
                 if_pc <= if_pc;
                 if_pc_current <= if_pc_current;
             end else begin
-                if_pc <= if_pc + 4;
+                if_pc <= predict_taken ? predict_target : if_pc + 4;
                 if_pc_current <= if_pc;
+                if_pred_taken <= predict_taken;
+                if_pred_target <= predict_target;
+                if_pred_hit <= predict_hit;
+                if_pred_counter <= predict_counter;
             end
 
-            if (!hazard_stall && !alu_stall)
+            if (!hazard_stall && !alu_stall) begin
                 id_pc <= if_pc_current;
+                id_pred_target <= if_pred_target;
+                id_pred_hit <= if_pred_hit;
+                id_pred_counter <= if_pred_counter;
+            end
 
             if (should_take_branch || branch_taken || halted || waiting_for_interrupt) begin
                 id_instr <= 0;
                 id_fetch_fault <= 0;
+                id_pred_taken <= 0;
             end else if (!hazard_stall && !alu_stall) begin
                 id_instr <= fetch_fault ? 32'b0 : if_instr;
                 id_fetch_fault <= fetch_fault;
+                id_pred_taken <= if_pred_taken;
             end
 
             if (!alu_stall || take_data_fault) begin
@@ -1106,6 +1185,12 @@ module cpu #(
                 ex_static_result <= id_static_result;
                 ex_signed_compare <= id_signed_compare;
                 ex_branch_target <= id_branch_target;
+                ex_jump_reg0 <= id_opcode == OP_BR;
+                ex_jump_reg1 <= id_opcode == OP_BLR;
+                ex_next_pc <= id_next_pc;
+                ex_pred_target <= id_pred_target;
+                ex_pred_hit <= id_pred_hit;
+                ex_pred_counter <= id_pred_counter;
                 ex_fwd_mem <= id_fwd_mem;
                 ex_fwd_wb <= id_fwd_wb;
                 ex_branch_fwd_mem <= id_fwd_mem[1:0];
@@ -1122,6 +1207,8 @@ module cpu #(
                     ex_branch_if_ne <= 0;
                     ex_branch_if_lt <= 0;
                     ex_branch_if_ge <= 0;
+                    ex_system_branch <= 0;
+                    ex_pred_taken <= 0;
                     ex_fetch_fault <= 0;
                 end else begin
                     ex_instr <= id_instr;
@@ -1134,6 +1221,8 @@ module cpu #(
                     ex_branch_if_ne <= id_branch_if_ne;
                     ex_branch_if_lt <= id_branch_if_lt;
                     ex_branch_if_ge <= id_branch_if_ge;
+                    ex_system_branch <= id_opcode == OP_ECALL || id_opcode == OP_ERET;
+                    ex_pred_taken <= id_pred_taken;
                     ex_fetch_fault <= id_fetch_fault;
                 end
             end
