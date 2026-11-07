@@ -28,10 +28,6 @@ module sdram #(
     output logic ready,
     output logic read_valid,
     output logic [31:0] read_data,
-    output logic write_done,
-    output logic [20:0] active_address,
-    output logic [31:0] active_data,
-    output logic [3:0] active_dqm,
 
     output logic sdrc_cmd_en,
     output logic [2:0] sdrc_cmd,
@@ -59,11 +55,13 @@ module sdram #(
     logic [2:0] delay;
     logic [$clog2(REFRESH_CYCLES) - 1:0] refresh_counter;
     logic refresh_pending;
+    logic [20:0] active_address;
+    logic [31:0] active_data;
+    logic [3:0] active_dqm;
 
     assign ready = state == S_IDLE && !refresh_pending && sdrc_init_done;
     assign read_valid = state == S_READ_DELAY && delay <= 3'd1;
     assign read_data = sdrc_data_r;
-    assign write_done = state == S_WRITE_DONE;
 
     assign sdrc_addr = active_address;
     assign sdrc_data_w = active_data;

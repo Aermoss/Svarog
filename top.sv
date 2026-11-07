@@ -256,11 +256,10 @@ module top (
     logic sdram_ready;
     logic sdram_valid;
     logic [31:0] sdram_read_data;
-    logic sdram_write_done;
-    logic [20:0] sdram_active_address;
-    logic [31:0] sdram_active_data;
-    logic [3:0] sdram_active_dqm;
     logic store_check;
+    logic [20:0] store_address;
+    logic [31:0] store_data;
+    logic [3:0] store_dqm;
 
     logic icache_request;
     logic [10:0] icache_tag;
@@ -360,7 +359,7 @@ module top (
 
         .flush(cpu_tlb_flush && cpu_cache_flush),
         .invalidate(store_check),
-        .invalidate_address(sdram_active_address),
+        .invalidate_address(store_address),
         .retag(mmu_walk_resolved),
         .new_tag(mmu_walk_frame),
 
@@ -389,9 +388,9 @@ module top (
 
         .flush(cpu_tlb_flush && cpu_cache_flush),
         .store(store_check),
-        .store_address(sdram_active_address),
-        .store_data(sdram_active_data),
-        .store_dqm(sdram_active_dqm),
+        .store_address(store_address),
+        .store_data(store_data),
+        .store_dqm(store_dqm),
 
         .grant(dcache_grant),
         .sdram_ready(sdram_ready),
@@ -417,10 +416,6 @@ module top (
         .ready(sdram_ready),
         .read_valid(sdram_valid),
         .read_data(sdram_read_data),
-        .write_done(sdram_write_done),
-        .active_address(sdram_active_address),
-        .active_data(sdram_active_data),
-        .active_dqm(sdram_active_dqm),
 
         .sdrc_cmd_en(sdrc_cmd_en),
         .sdrc_cmd(sdrc_cmd),
@@ -467,9 +462,11 @@ module top (
         .sdram_data(sdram_data),
         .sdram_dqm(sdram_dqm),
         .sdram_ready(sdram_ready),
-        .sdram_write_done(sdram_write_done),
         .sdram_read_data(sdram_read_data),
         .store_check(store_check),
+        .store_address(store_address),
+        .store_data(store_data),
+        .store_dqm(store_dqm),
 
         .icache_request(icache_request),
         .icache_tag(icache_tag),
