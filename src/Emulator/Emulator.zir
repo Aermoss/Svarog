@@ -15,7 +15,7 @@
  */
 
 #[include "std/io", "std/str", "std/vec", "std/file", "std/thrd",
-    "src/Common/File.zir", "src/Common/Endian.zir", "src/Common/Instruction.zir" : *]
+    "src/Common/File.zir", "src/Common/Endian.zir", "src/Common/Instruction.zir", "src/Emulator/Esp.zir" : *]
 
 extern "C" {
     fn _getch() -> i32;
@@ -70,7 +70,8 @@ class Emulator {
     flash_address: u32,
     flash_paths: Vector<String>,
     flash_offsets: Vector<u32>,
-    flash_sizes: Vector<u32>;
+    flash_sizes: Vector<u32>,
+    esp: Esp01;
 
     Emulator(&mut this, quiet: bool) {
         this.quiet = quiet;
@@ -155,6 +156,7 @@ class Emulator {
         this.timer_compare = 0;
         (this.flash_selected, this.flash_write_enabled, this.flash_read_warned) = (false, false, false);
         (this.flash_command, this.flash_rx, this.flash_count, this.flash_address) = (0, 0, 0, 0);
+        this.esp.Reset();
 
         for i in 0..32 {
             this.registers[i as usize] = 0;
@@ -172,7 +174,8 @@ class Emulator {
     }
 
     fn IsDevice(&this, address: u32) -> bool {
-        address == 0xFFFF || address == 0xFFFC || address == 0xFFF4 || address == 0xFFEC || address == 0xFFE8 || address == 0xFFE4 || address == 0xFFDC || address == 0xFFD8 || address == 0xFFD4
+        address == 0xFFFF || address == 0xFFFC || address == 0xFFF4 || address == 0xFFEC || address == 0xFFE8 || address == 0xFFE4 || address == 0xFFDC || address == 0xFFD8 || address == 0xFFD4 ||
+            address == 0xFFC8 || address == 0xFFC4 || address == 0xFFC0 || address == 0xFFBC
     }
 
     fn SelectFlash(&mut this, selected: bool) {
@@ -275,7 +278,8 @@ class Emulator {
     fn GetPendingInterrupts(&mut this, mask: u32) -> u32 {
         let uart: u32 = if (mask & 2) != 0 && this.IsUartReady() { 2 } else { 0 };
         let timer: u32 = if (mask & 1) != 0 && ((this.cycle_counter as u32 - this.timer_compare) as i32) >= 0 { 1 } else { 0 };
-        uart | timer
+        let esp: u32 = if (mask & 4) != 0 && this.esp.HasByte(this.cycle_counter) { 4 } else { 0 };
+        esp | uart | timer
     }
 
     fn ReadCSR(&mut this, index: u32) -> u32 {
@@ -288,7 +292,7 @@ class Emulator {
         } else if index == CSR::IENABLE as u32 {
             this.interrupt_mask
         } else if index == CSR::IPENDING as u32 {
-            this.GetPendingInterrupts(3)
+            this.GetPendingInterrupts(7)
         } else if index == CSR::EPC as u32 {
             this.trap_pc
         } else if index == CSR::CAUSE as u32 {
@@ -452,6 +456,10 @@ class Emulator {
             0xFFDC => this.timer_compare,
             0xFFD8 => this.flash_rx as u32,
             0xFFD4 => if this.flash_selected { 1 } else { 0 },
+            0xFFC8 => this.esp.ReadByte(this.cycle_counter),
+            0xFFC4 => this.esp.Status(this.cycle_counter),
+            0xFFC0 => this.esp.divisor,
+            0xFFBC => this.esp.control,
             _ => (this.cycle_counter / CYCLES_PER_MS as u64) as u32
         }
     }
@@ -500,6 +508,10 @@ class Emulator {
     fn WriteByte(&mut this, address: u32, value: u8) {
         if address == 0xFFFF {
             Write((value as i8).ToString());
+        } else if address == 0xFFC8 {
+            this.esp.WriteByte(value, this.cycle_counter);
+        } else if address == 0xFFBC {
+            this.esp.SetControl(value as u32, this.cycle_counter);
         } else if address == 0xFFF0 {
             if !this.quiet {
                 WriteLine("[LEDs: 0x" + String::FromInteger(value as u64, 16) + ']');
@@ -533,6 +545,9 @@ class Emulator {
             0xFFDC => {
                 this.timer_compare = value;
             },
+            0xFFC0 => {
+                this.esp.divisor = value & 0xFFFF;
+            },
             0xFFD4 => {
                 this.SelectFlash((value & 1) != 0);
             },
@@ -551,15 +566,29 @@ class Emulator {
     fn WaitForInterrupt(&mut this) {
         let timer_enabled = (this.interrupt_mask & 1) != 0;
         let uart_enabled = (this.interrupt_mask & 2) != 0;
-        if !timer_enabled && !uart_enabled { return; }
-        let cycles_until_timer = (this.timer_compare - this.cycle_counter as u32) as i32;
+        let esp_enabled = (this.interrupt_mask & 4) != 0;
+        if !timer_enabled && !uart_enabled && !esp_enabled { return; }
+        if esp_enabled && this.esp.HasByte(this.cycle_counter) { return; }
+        let mut has_deadline = timer_enabled;
+        let mut cycles_until_deadline: i64 = if timer_enabled { (this.timer_compare - this.cycle_counter as u32) as i32 as i64 } else { 0 };
+
+        if esp_enabled && this.esp.NextTime() > this.cycle_counter {
+            let cycles_until_esp = (this.esp.NextTime() - this.cycle_counter) as i64;
+
+            if !has_deadline || cycles_until_esp < cycles_until_deadline {
+                cycles_until_deadline = cycles_until_esp;
+            }
+
+            has_deadline = true;
+        }
+
         let mut elapsed_cycles: u64 = 0;
         this.uart_mutex.Lock();
         let started = Instant::Now();
 
-        while (!uart_enabled || !this.uart_rx_ready) && (!timer_enabled || (cycles_until_timer > 0 && elapsed_cycles < cycles_until_timer as u64)) {
-            let timeout = if timer_enabled {
-                ((cycles_until_timer as u64 - elapsed_cycles + CYCLES_PER_MS as u64 - 1) / CYCLES_PER_MS as u64) as u32
+        while (!uart_enabled || !this.uart_rx_ready) && (!has_deadline || (cycles_until_deadline > 0 && elapsed_cycles < cycles_until_deadline as u64)) {
+            let timeout = if has_deadline {
+                ((cycles_until_deadline as u64 - elapsed_cycles + CYCLES_PER_MS as u64 - 1) / CYCLES_PER_MS as u64) as u32
             } else { INFINITE };
 
             this.uart_changed.Wait(&mut this.uart_mutex, timeout);
@@ -581,7 +610,7 @@ class Emulator {
         } else { 0 };
 
         if interrupts != 0 {
-            this.Trap(if (interrupts & 1) != 0 { TrapCause::Timer as u32 } else { TrapCause::Uart as u32 }, this.pc, 0);
+            this.Trap(if (interrupts & 1) != 0 { TrapCause::Timer as u32 } else if (interrupts & 2) != 0 { TrapCause::Uart as u32 } else { TrapCause::Esp as u32 }, this.pc, 0);
         }
 
         let mut fetch_address: u32 = 0;

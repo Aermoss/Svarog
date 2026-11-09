@@ -114,39 +114,97 @@ module uart_rx #(
         end
     end
 
-    logic [7:0] fifo [0:FIFO_DEPTH - 1];
-    logic [POINTER_BITS - 1:0] fifo_head;
-    logic [POINTER_BITS - 1:0] fifo_tail;
-    logic [POINTER_BITS:0] fifo_count;
-    logic fifo_push;
-    logic fifo_pop;
+    generate
+        if (FIFO_DEPTH <= 64) begin : register_fifo
+            logic [7:0] fifo [0:FIFO_DEPTH - 1];
+            logic [POINTER_BITS - 1:0] fifo_head;
+            logic [POINTER_BITS - 1:0] fifo_tail;
+            logic [POINTER_BITS:0] fifo_count;
+            logic fifo_push;
+            logic fifo_pop;
 
-    assign fifo_pop = read_ack && fifo_count != 0;
-    assign fifo_push = byte_received && (fifo_count != FIFO_DEPTH || fifo_pop);
-    assign rx_byte = fifo[fifo_head];
-    assign rx_ready = fifo_count != 0;
+            assign fifo_pop = read_ack && fifo_count != 0;
+            assign fifo_push = byte_received && (fifo_count != FIFO_DEPTH || fifo_pop);
+            assign rx_byte = fifo[fifo_head];
+            assign rx_ready = fifo_count != 0;
 
-    always_ff @(posedge clk) begin
-        if (fifo_push)
-            fifo[fifo_tail] <= rx_data_reg;
-    end
+            always_ff @(posedge clk) begin
+                if (fifo_push)
+                    fifo[fifo_tail] <= rx_data_reg;
+            end
 
-    always_ff @(posedge clk or posedge rst) begin
-        if (rst) begin
-            fifo_head <= 0;
-            fifo_tail <= 0;
-            fifo_count <= 0;
-        end else begin
-            if (fifo_push)
-                fifo_tail <= fifo_tail + 1'b1;
+            always_ff @(posedge clk or posedge rst) begin
+                if (rst) begin
+                    fifo_head <= 0;
+                    fifo_tail <= 0;
+                    fifo_count <= 0;
+                end else begin
+                    if (fifo_push)
+                        fifo_tail <= fifo_tail + 1'b1;
 
-            if (fifo_pop)
-                fifo_head <= fifo_head + 1'b1;
+                    if (fifo_pop)
+                        fifo_head <= fifo_head + 1'b1;
 
-            case ({fifo_push, fifo_pop})
-                2'b10: fifo_count <= fifo_count + 1'b1;
-                2'b01: fifo_count <= fifo_count - 1'b1;
-            endcase
+                    case ({fifo_push, fifo_pop})
+                        2'b10: fifo_count <= fifo_count + 1'b1;
+                        2'b01: fifo_count <= fifo_count - 1'b1;
+                    endcase
+                end
+            end
+        end else begin : block_fifo
+            logic [7:0] fifo [0:FIFO_DEPTH - 1];
+            logic [7:0] fifo_read;
+            logic [POINTER_BITS - 1:0] fifo_head;
+            logic [POINTER_BITS - 1:0] fifo_tail;
+            logic [POINTER_BITS:0] fifo_count;
+            logic fetching;
+            logic output_valid;
+            logic [7:0] output_byte;
+
+            wire fifo_pop = read_ack && output_valid;
+            wire fifo_push = byte_received && fifo_count != FIFO_DEPTH;
+            wire fifo_issue = fifo_count != 0 && !fetching && (!output_valid || fifo_pop);
+
+            assign rx_byte = output_byte;
+            assign rx_ready = output_valid;
+
+            always_ff @(posedge clk) begin
+                if (fifo_push)
+                    fifo[fifo_tail] <= rx_data_reg;
+
+                fifo_read <= fifo[fifo_head];
+            end
+
+            always_ff @(posedge clk or posedge rst) begin
+                if (rst) begin
+                    fifo_head <= 0;
+                    fifo_tail <= 0;
+                    fifo_count <= 0;
+                    fetching <= 1'b0;
+                    output_valid <= 1'b0;
+                    output_byte <= 8'b0;
+                end else begin
+                    if (fifo_push)
+                        fifo_tail <= fifo_tail + 1'b1;
+
+                    if (fifo_issue)
+                        fifo_head <= fifo_head + 1'b1;
+
+                    case ({fifo_push, fifo_issue})
+                        2'b10: fifo_count <= fifo_count + 1'b1;
+                        2'b01: fifo_count <= fifo_count - 1'b1;
+                    endcase
+
+                    fetching <= fifo_issue;
+
+                    if (fetching) begin
+                        output_byte <= fifo_read;
+                        output_valid <= 1'b1;
+                    end else if (fifo_pop) begin
+                        output_valid <= 1'b0;
+                    end
+                end
+            end
         end
-    end
+    endgenerate
 endmodule

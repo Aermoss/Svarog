@@ -21,6 +21,11 @@ module top (
     input logic uart_rx,
     output logic uart_tx,
 
+    input logic esp_rx,
+    output logic esp_tx,
+    output logic esp_enable,
+    output logic esp_reset_n,
+
     input logic button,
     output logic [5:0] leds,
     output logic ws2812,
@@ -114,6 +119,11 @@ module top (
 
         .uart_rx(uart_rx),
         .uart_tx(uart_tx),
+
+        .esp_rx(esp_rx),
+        .esp_tx(esp_tx),
+        .esp_enable(esp_enable),
+        .esp_reset_n(esp_reset_n),
 
         .button(button),
         .leds(leds),

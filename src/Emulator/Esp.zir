@@ -1,0 +1,411 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/str", "std/vec", "std/time" : *]
+
+const ESP_ENABLE: u32 = 1;
+const ESP_RUN: u32 = 2;
+const ESP_CYCLES_PER_MS: u64 = 54000;
+const ESP_NETWORK_COUNT: usize = 3;
+const ESP_NTP_UNIX_OFFSET: u32 = 2208988800;
+
+class EspNetwork {
+    pub ssid: String,
+    pub bssid: String,
+    pub rssi: i32,
+    pub channel: u32,
+    pub encryption: u32;
+
+    EspNetwork(&mut this) {}
+
+    EspNetwork(&mut this, ssid: *i8, bssid: *i8, rssi: i32, channel: u32, encryption: u32) {
+        (this.ssid, this.bssid, this.rssi, this.channel, this.encryption) = (ssid.ToString(), bssid.ToString(), rssi, channel, encryption);
+    }
+}
+
+class Esp01 {
+    pub control: u32 = 0,
+    pub divisor: u32 = 468,
+    echo: bool = true,
+    mode: u32 = 1,
+    connected: bool = false,
+    network: usize = 0,
+    line: String,
+    output: Vector<u8>,
+    times: Vector<u64>,
+    read_index: usize = 0,
+    last_time: u64 = 0,
+    link_open: bool = false,
+    link_port: u32 = 0,
+    send_remaining: u32 = 0,
+    send_data: Vector<u8>,
+    networks: Vector<EspNetwork>;
+
+    Esp01(&mut this) {
+        this.networks.PushBack(EspNetwork("Svarog", "5c:cf:7f:10:20:30", -42, 6, 3));
+        this.networks.PushBack(EspNetwork("Triglav Guest", "5c:cf:7f:40:50:60", -67, 11, 0));
+        this.networks.PushBack(EspNetwork("Zircon-5G", "a4:2b:b0:70:80:90", -80, 1, 4));
+    }
+
+    pub fn Reset(&mut this) {
+        (this.control, this.divisor) = (0, 468);
+        this.PowerOff();
+    }
+
+    fn Running(&this) -> bool {
+        this.control == (ESP_ENABLE | ESP_RUN)
+    }
+
+    fn PowerOff(&mut this) {
+        (this.echo, this.mode, this.connected, this.read_index, this.last_time) = (true, 1, false, 0, 0);
+        (this.link_open, this.link_port, this.send_remaining) = (false, 0, 0);
+        this.line.Clear();
+        this.output.Clear();
+        this.times.Clear();
+        this.send_data.Clear();
+    }
+
+    fn Boot(&mut this, cycle: u64) {
+        this.PowerOff();
+        this.Queue("\x02\x9C\xFE\x12\x8C\xEC", cycle, 30);
+        this.Queue("\r\nready\r\n", cycle, 300);
+    }
+
+    pub fn SetControl(&mut this, value: u32, cycle: u64) {
+        let running = this.Running();
+        this.control = value & (ESP_ENABLE | ESP_RUN);
+
+        if !this.Running() {
+            this.PowerOff();
+        } else if !running {
+            this.Boot(cycle);
+        }
+    }
+
+    fn Queue(&mut this, text: *i8, cycle: u64, delay: u64) {
+        this.Queue(text.ToString(), cycle, delay);
+    }
+
+    fn Queue(&mut this, text: &String, cycle: u64, delay: u64) {
+        let mut time = cycle + delay * ESP_CYCLES_PER_MS;
+
+        if time < this.last_time {
+            time = this.last_time;
+        }
+
+        this.last_time = time;
+
+        for i in 0..text.Length() {
+            this.output.PushBack(text[i] as u8);
+            this.times.PushBack(time);
+        }
+    }
+
+    fn QueueBytes(&mut this, bytes: &Vector<u8>, cycle: u64, delay: u64) {
+        let mut time = cycle + delay * ESP_CYCLES_PER_MS;
+
+        if time < this.last_time {
+            time = this.last_time;
+        }
+
+        this.last_time = time;
+
+        for value in bytes {
+            this.output.PushBack(value);
+            this.times.PushBack(time);
+        }
+    }
+
+    pub fn HasByte(&this, cycle: u64) -> bool {
+        this.read_index < this.output.Length() && this.times[this.read_index] <= cycle
+    }
+
+    pub fn NextTime(&this) -> u64 {
+        if this.read_index < this.output.Length() { this.times[this.read_index] } else { 0 }
+    }
+
+    pub fn Status(&this, cycle: u64) -> u32 {
+        if this.HasByte(cycle) { 1 } else { 0 }
+    }
+
+    pub fn ReadByte(&mut this, cycle: u64) -> u32 {
+        if !this.HasByte(cycle) {
+            return 0;
+        }
+
+        let value = this.output[this.read_index] as u32;
+        this.read_index += 1;
+
+        if this.read_index == this.output.Length() {
+            this.output.Clear();
+            this.times.Clear();
+            this.read_index = 0;
+        }
+
+        value
+    }
+
+    pub fn WriteByte(&mut this, value: u8, cycle: u64) {
+        if !this.Running() {
+            return;
+        }
+
+        if this.send_remaining > 0 {
+            this.send_data.PushBack(value);
+            this.send_remaining -= 1;
+
+            if this.send_remaining == 0 {
+                this.Sent(cycle);
+            }
+
+            return;
+        }
+
+        if this.echo {
+            let mut text = String();
+            text += value as i8;
+            this.Queue(text, cycle, 0);
+        }
+
+        if value == '\n' as u8 {
+            let mut command = this.line;
+
+            if !command.Empty() && command[command.Length() - 1] == '\r' {
+                command = command.SubString(0, command.Length() - 1);
+            }
+
+            this.line.Clear();
+            this.Execute(command, cycle);
+        } else if this.line.Length() < 256 {
+            this.line += value as i8;
+        }
+    }
+
+    fn ParseQuoted(&this, text: &String, start: usize, value: &mut String) -> usize {
+        if start >= text.Length() || text[start] != '"' {
+            return 0;
+        }
+
+        let mut i = start + 1;
+
+        while i < text.Length() && text[i] != '"' {
+            if text[i] == '\\' && i + 1 < text.Length() {
+                i += 1;
+            }
+
+            value += text[i];
+            i += 1;
+        }
+
+        if i >= text.Length() { 0 } else { i + 1 }
+    }
+
+    fn FindNetwork(&this, ssid: &String) -> usize {
+        for i in 0..this.networks.Length() {
+            if this.networks[i].ssid == ssid {
+                return i;
+            }
+        }
+
+        ESP_NETWORK_COUNT
+    }
+
+    fn Join(&mut this, command: &String, cycle: u64) {
+        let (mut ssid, mut password) = (String(), String());
+        let next = this.ParseQuoted(command, 9, ssid);
+
+        if next == 0 || next >= command.Length() || command[next] != ',' || this.ParseQuoted(command, next + 1, password) != command.Length() {
+            this.Queue("\r\nERROR\r\n", cycle, 0);
+            return;
+        }
+
+        if this.connected {
+            this.connected = false;
+            this.Queue("WIFI DISCONNECT\r\n", cycle, 0);
+        }
+
+        let index = this.FindNetwork(ssid);
+
+        if index == ESP_NETWORK_COUNT {
+            this.Queue("+CWJAP:3\r\n\r\nFAIL\r\n", cycle, 3000);
+            return;
+        }
+
+        if this.networks[index].encryption != 0 && password.Length() < 8 {
+            this.Queue("+CWJAP:2\r\n\r\nFAIL\r\n", cycle, 3000);
+            return;
+        }
+
+        (this.connected, this.network) = (true, index);
+        this.Queue("WIFI CONNECTED\r\n", cycle, 1500);
+        this.Queue("WIFI GOT IP\r\n\r\nOK\r\n", cycle, 2500);
+    }
+
+    fn Open(&mut this, command: &String, cycle: u64) {
+        let (mut kind, mut host) = (String(), String());
+        let next = this.ParseQuoted(command, 12, kind);
+        let mut port_start: usize = 0;
+
+        if next != 0 && next < command.Length() && command[next] == ',' {
+            let after = this.ParseQuoted(command, next + 1, host);
+
+            if after != 0 && after < command.Length() && command[after] == ',' {
+                port_start = after + 1;
+            }
+        }
+
+        if port_start == 0 || (kind != "UDP" && kind != "TCP") || !this.connected {
+            this.Queue("\r\nERROR\r\n", cycle, 0);
+            return;
+        }
+
+        if this.link_open {
+            this.Queue("ALREADY CONNECTED\r\n\r\nERROR\r\n", cycle, 0);
+            return;
+        }
+
+        (this.link_open, this.link_port) = (true, String::ToInteger(command.SubString(port_start), 10).UnwrapOr(0) as u32);
+        this.Queue("CONNECT\r\n\r\nOK\r\n", cycle, 100);
+    }
+
+    fn Sent(&mut this, cycle: u64) {
+        let length = this.send_data.Length();
+        this.Queue("\r\nRecv " + String::FromInteger(length as u64, 10) + " bytes\r\n\r\nSEND OK\r\n", cycle, 10);
+
+        if this.link_port != 123 || length != 48 || (this.send_data[0] & 7) != 3 {
+            return;
+        }
+
+        let seconds = SystemTime::Now().UnixSeconds() as u32 + ESP_NTP_UNIX_OFFSET;
+        let mut reply = Vector<u8>();
+
+        for _ in 0..48 {
+            reply.PushBack(0);
+        }
+
+        (reply[0], reply[1]) = (0x1C, 2);
+        (reply[40], reply[41], reply[42], reply[43]) = ((seconds >> 24) as u8, (seconds >> 16) as u8, (seconds >> 8) as u8, seconds as u8);
+        this.Queue("\r\n+IPD,48:", cycle, 60);
+        this.QueueBytes(reply, cycle, 60);
+    }
+
+    fn Execute(&mut this, command: &String, cycle: u64) {
+        if command.Empty() {
+            return;
+        }
+
+        if command == "AT" {
+            this.Queue("\r\nOK\r\n", cycle, 0);
+        } else if command == "ATE0" || command == "ATE1" {
+            this.echo = command == "ATE1";
+            this.Queue("\r\nOK\r\n", cycle, 0);
+        } else if command == "AT+RST" {
+            this.Queue("\r\nOK\r\n", cycle, 0);
+            let restart = cycle + 100 * ESP_CYCLES_PER_MS;
+            (this.connected, this.echo, this.link_open) = (false, true, false);
+            this.Queue("\x02\x9C\xFE\x12\x8C\xEC", restart, 30);
+            this.Queue("\r\nready\r\n", restart, 300);
+        } else if command == "AT+GMR" {
+            this.Queue("AT version:0.0.0.0(svarog-emu)\r\nSDK version:emulated\r\n\r\nOK\r\n", cycle, 0);
+        } else if command == "AT+CWMODE?" {
+            this.Queue("+CWMODE:" + String::FromInteger(this.mode as u64, 10) + "\r\n\r\nOK\r\n", cycle, 0);
+        } else if command.StartsWith("AT+CWMODE=") {
+            let value = command.SubString(10);
+
+            if value == "1" || value == "2" || value == "3" {
+                this.mode = (value[0] - '0') as u32;
+                this.Queue("\r\nOK\r\n", cycle, 0);
+            } else {
+                this.Queue("\r\nERROR\r\n", cycle, 0);
+            }
+        } else if command == "AT+CWLAP" {
+            if this.mode == 2 {
+                this.Queue("\r\nERROR\r\n", cycle, 0);
+                return;
+            }
+
+            let mut text = String();
+
+            for network in this.networks {
+                text += "+CWLAP:(" + String::FromInteger(network.encryption as u64, 10) + ",\"" + network.ssid + "\"," +
+                    String::FromInteger(network.rssi as HostSigned) + ",\"" + network.bssid + "\"," + String::FromInteger(network.channel as u64, 10) + ")\r\n";
+            }
+
+            this.Queue(text + "\r\nOK\r\n", cycle, 1500);
+        } else if command.StartsWith("AT+CWJAP=") {
+            if this.mode == 2 {
+                this.Queue("\r\nERROR\r\n", cycle, 0);
+                return;
+            }
+
+            this.Join(command, cycle);
+        } else if command == "AT+CWJAP?" {
+            if this.connected {
+                let network = this.networks[this.network];
+                this.Queue("+CWJAP:\"" + network.ssid + "\",\"" + network.bssid + "\"," + String::FromInteger(network.channel as u64, 10) + "," +
+                    String::FromInteger(network.rssi as HostSigned) + "\r\n\r\nOK\r\n", cycle, 0);
+            } else {
+                this.Queue("No AP\r\n\r\nOK\r\n", cycle, 0);
+            }
+        } else if command == "AT+CWQAP" {
+            this.Queue("\r\nOK\r\n", cycle, 0);
+
+            if this.connected {
+                (this.connected, this.link_open) = (false, false);
+                this.Queue("WIFI DISCONNECT\r\n", cycle, 0);
+            }
+        } else if command.StartsWith("AT+PING=") {
+            let mut host = String();
+
+            if this.ParseQuoted(command, 8, host) != command.Length() {
+                this.Queue("\r\nERROR\r\n", cycle, 0);
+            } else if !this.connected {
+                this.Queue("+timeout\r\n\r\nERROR\r\n", cycle, 1000);
+            } else if host.EndsWith(".invalid") {
+                this.Queue("\r\nERROR\r\n", cycle, 300);
+            } else {
+                let time = 12 + cycle / ESP_CYCLES_PER_MS % 17;
+                this.Queue("+" + String::FromInteger(time, 10) + "\r\n\r\nOK\r\n", cycle, time);
+            }
+        } else if command.StartsWith("AT+CIPSTART=") {
+            this.Open(command, cycle);
+        } else if command.StartsWith("AT+CIPSEND=") {
+            let length = String::ToInteger(command.SubString(11), 10).UnwrapOr(0);
+
+            if !this.link_open {
+                this.Queue("link is not valid\r\n\r\nERROR\r\n", cycle, 0);
+            } else if length <= 0 || length > 2048 {
+                this.Queue("\r\nERROR\r\n", cycle, 0);
+            } else {
+                this.send_remaining = length as u32;
+                this.send_data.Clear();
+                this.Queue("\r\nOK\r\n> ", cycle, 0);
+            }
+        } else if command == "AT+CIPCLOSE" {
+            if this.link_open {
+                this.link_open = false;
+                this.Queue("CLOSED\r\n\r\nOK\r\n", cycle, 0);
+            } else {
+                this.Queue("\r\nERROR\r\n", cycle, 0);
+            }
+        } else if command == "AT+CIFSR" {
+            let address = (if this.connected { "192.168.1.42" } else { "0.0.0.0" }).ToString();
+            this.Queue("+CIFSR:STAIP,\"" + address + "\"\r\n+CIFSR:STAMAC,\"5c:cf:7f:a0:b1:c2\"\r\n\r\nOK\r\n", cycle, 0);
+        } else {
+            this.Queue("\r\nERROR\r\n", cycle, 0);
+        }
+    }
+}

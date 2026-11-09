@@ -24,6 +24,11 @@ module cpu #(
     input logic uart_rx,
     output logic uart_tx,
 
+    input logic esp_rx,
+    output logic esp_tx,
+    output logic esp_enable,
+    output logic esp_reset_n,
+
     input logic button,
     output logic [5:0] leds,
     output logic ws2812,
@@ -716,13 +721,47 @@ module cpu #(
         .out(ws2812)
     );
 
+    logic [7:0] esp_read_data;
+    logic esp_rx_ready;
+    logic esp_tx_busy;
+    logic [15:0] esp_divisor;
+
+    uart #(
+        .CLK_FREQ(CLK_FREQ),
+        .FIFO_DEPTH(2048)
+    ) esp_uart0 (
+        .clk(clk),
+        .rst(rst),
+        .write(mem_addr == 32'hFFC8 && io_we != 0),
+        .write_data(mem_write[7:0]),
+        .read(mem_addr == 32'hFFC8 && io_read),
+        .read_data(esp_read_data),
+        .rx_ready(esp_rx_ready),
+        .tx_busy(esp_tx_busy),
+        .divisor_write(mem_addr == 32'hFFC0 && io_we != 0),
+        .divisor_data(mem_write[15:0]),
+        .divisor(esp_divisor),
+        .rx_pin(esp_rx),
+        .tx_pin(esp_tx)
+    );
+
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) begin
+            esp_enable <= 1'b0;
+            esp_reset_n <= 1'b0;
+        end else if (mem_addr == 32'hFFBC && io_we != 0) begin
+            {esp_reset_n, esp_enable} <= mem_write[1:0];
+        end
+    end
+
     always_comb begin
         uart_we = 0;
         actual_mem_we = 0;
 
         if (mem_addr == 32'hFFFF)
             uart_we = io_we;
-        else if (mem_addr != 32'hFFF0 && mem_addr != 32'hFFE0 && mem_addr != 32'hFFEC && mem_addr != 32'hFFF4 && mem_addr != 32'hFFF8 && mem_addr != 32'hFFE8 && mem_addr != 32'hFFE4 && mem_addr != 32'hFFDC && mem_addr != 32'hFFD8 && mem_addr != 32'hFFD4 && mem_addr != 32'hFFD0 && mem_addr != 32'hFFCC && !in_text_window)
+        else if (mem_addr != 32'hFFF0 && mem_addr != 32'hFFE0 && mem_addr != 32'hFFEC && mem_addr != 32'hFFF4 && mem_addr != 32'hFFF8 && mem_addr != 32'hFFE8 && mem_addr != 32'hFFE4 && mem_addr != 32'hFFDC && mem_addr != 32'hFFD8 && mem_addr != 32'hFFD4 && mem_addr != 32'hFFD0 && mem_addr != 32'hFFCC &&
+                mem_addr != 32'hFFC8 && mem_addr != 32'hFFC4 && mem_addr != 32'hFFC0 && mem_addr != 32'hFFBC && !in_text_window)
             actual_mem_we = mem_we;
     end
 
@@ -748,7 +787,7 @@ module cpu #(
     logic ex_privileged;
     logic take_exception;
 
-    assign csr_ipending = {30'b0, uart_rx_ready, timer_pending};
+    assign csr_ipending = {29'b0, esp_rx_ready, uart_rx_ready, timer_pending};
     assign interrupts = csr_ipending & csr_ienable;
     assign take_interrupt = csr_ie && interrupts != 0 && !halted && !take_data_fault && (waiting_for_interrupt || (ex_instr != 0 && !is_multicycle_op));
 
@@ -775,7 +814,7 @@ module cpu #(
 
     assign take_exception = !take_interrupt && !take_data_fault && !halted &&
         (ex_fetch_fault || ex_opcode == OP_EBREAK || !ex_defined || (ex_csr_writes && ex_csr_read_only) || (user_mode && ex_privileged));
-    assign should_wait = ex_opcode == OP_WFI && !take_exception && !take_data_fault && csr_ienable[1:0] != 0 && interrupts == 0;
+    assign should_wait = ex_opcode == OP_WFI && !take_exception && !take_data_fault && csr_ienable[2:0] != 0 && interrupts == 0;
     assign wake_from_interrupt = waiting_for_interrupt && interrupts != 0;
 
     always_comb begin
@@ -822,7 +861,7 @@ module cpu #(
                 user_mode <= 0;
             end else if (take_interrupt) begin
                 csr_epc <= waiting_for_interrupt ? if_pc : ex_pc;
-                csr_cause <= interrupts[0] ? 32'h80000000 : 32'h80000001;
+                csr_cause <= interrupts[0] ? 32'h80000000 : (interrupts[1] ? 32'h80000001 : 32'h80000002);
                 csr_pie <= csr_ie;
                 csr_ie <= 0;
                 csr_pu <= user_mode;
@@ -1002,6 +1041,10 @@ module cpu #(
             32'hFFD4: io_read_word = {30'b0, flash_raw_busy, flash_raw_enable};
             32'hFFD0: io_read_word = {16'b0, video_cursor};
             32'hFFCC: io_read_word = {27'b0, video_scroll};
+            32'hFFC8: io_read_word = {24'b0, esp_read_data};
+            32'hFFC4: io_read_word = {30'b0, esp_tx_busy, esp_rx_ready};
+            32'hFFC0: io_read_word = {16'b0, esp_divisor};
+            32'hFFBC: io_read_word = {30'b0, esp_reset_n, esp_enable};
             default: begin
                 io_read_word = 0;
                 io_read_hit = stage_mem_addr[31:14] == 18'd2;
