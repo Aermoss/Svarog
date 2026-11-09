@@ -189,8 +189,8 @@ class Disassembler {
         match _type {
             RelocationType::AbsoluteUpper21 => "R_ABS_HI21",
             RelocationType::AbsoluteLower11 => "R_ABS_LO11",
-            RelocationType::PcRelativeUpper21 => "R_PCREL_HI21",
-            RelocationType::PcRelativeLower11 => "R_PCREL_LO11",
+            RelocationType::PCRelativeUpper21 => "R_PCREL_HI21",
+            RelocationType::PCRelativeLower11 => "R_PCREL_LO11",
             RelocationType::Branch16 => "R_BR16",
             RelocationType::Branch21 => "R_BR21",
             RelocationType::Branch26 => "R_BR26",

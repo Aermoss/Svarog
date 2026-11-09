@@ -42,7 +42,7 @@ module sdram #(
 );
     localparam int REFRESH_CYCLES = CLK_FREQ / 1000000 * 15;
     localparam logic [2:0] DEFAULT_LATENCY = 3'd5;
-    localparam logic [20:0] CALIBRATION_ADDRESS = 21'h000000;
+    localparam logic [20:0] CALIBRATION_ADDRESS = 21'h1FFFFC;
     localparam logic [1:0] CALIBRATION_ATTEMPTS = 2'd3;
 
     typedef enum logic [2:0] {

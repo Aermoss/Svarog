@@ -25,6 +25,10 @@ module top (
     output logic esp_tx,
     output logic esp_enable,
     output logic esp_reset_n,
+    output logic sd_clk,
+    output logic sd_mosi,
+    input logic sd_miso,
+    output logic sd_cs_n,
 
     input logic button,
     output logic [5:0] leds,
@@ -92,11 +96,6 @@ module top (
     logic [31:0] cpu_mem_write;
     logic [31:0] cpu_mem_read;
     logic cpu_stall;
-    logic flash_raw_enable;
-    logic flash_raw_start;
-    logic [7:0] flash_raw_tx;
-    logic [7:0] flash_raw_rx;
-    logic flash_raw_busy;
     logic video_write;
     logic [11:0] video_address;
     logic [15:0] video_data;
@@ -124,16 +123,14 @@ module top (
         .esp_tx(esp_tx),
         .esp_enable(esp_enable),
         .esp_reset_n(esp_reset_n),
+        .sd_clk(sd_clk),
+        .sd_mosi(sd_mosi),
+        .sd_miso(sd_miso),
+        .sd_cs_n(sd_cs_n),
 
         .button(button),
         .leds(leds),
         .ws2812(ws2812),
-
-        .flash_raw_enable(flash_raw_enable),
-        .flash_raw_start(flash_raw_start),
-        .flash_raw_tx(flash_raw_tx),
-        .flash_raw_rx(flash_raw_rx),
-        .flash_raw_busy(flash_raw_busy),
 
         .video_write(video_write),
         .video_address(video_address),
@@ -248,11 +245,6 @@ module top (
         .flash_addr(flash_addr),
         .flash_rdata(flash_rdata),
         .flash_ready(flash_ready),
-        .raw_enable(flash_raw_enable),
-        .raw_start(flash_raw_start),
-        .raw_tx(flash_raw_tx),
-        .raw_rx(flash_raw_rx),
-        .raw_busy(flash_raw_busy),
         .flash_cs(spi_cs_pin),
         .flash_sck(spi_clk_pin),
         .flash_mosi(spi_mosi_pin),

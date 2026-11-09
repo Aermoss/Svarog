@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-module ws2812_tx #(
+module ws2812 #(
     parameter int CLK_FREQ = 54000000
 ) (
     input logic clk,

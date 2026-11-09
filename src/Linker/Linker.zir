@@ -170,10 +170,10 @@ class Linker {
                     RelocationType::AbsoluteLower11 => {
                         word = (word & !IMM11_MASK) | (target & IMM11_MASK);
                     },
-                    RelocationType::PcRelativeUpper21 => {
+                    RelocationType::PCRelativeUpper21 => {
                         word = (word & !IMM21_MASK) | (((target - pc) >> 11) & IMM21_MASK);
                     },
-                    RelocationType::PcRelativeLower11 => {
+                    RelocationType::PCRelativeLower11 => {
                         word = (word & !IMM16_MASK) | (((target - (pc - 4)) & IMM11_MASK) & IMM16_MASK);
                     },
                     RelocationType::Branch16 => {

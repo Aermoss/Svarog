@@ -15,11 +15,15 @@
  */
 
 #[include "std/io", "std/str", "std/vec", "std/file", "std/thrd",
-    "src/Common/File.zir", "src/Common/Endian.zir", "src/Common/Instruction.zir", "src/Emulator/Esp.zir" : *]
+    "src/Common/File.zir", "src/Common/Endian.zir", "src/Common/Instruction.zir", "src/Emulator/ESP.zir", "src/Emulator/SD.zir" : *]
 
 extern "C" {
-    fn _getch() -> i32;
+    fn _getwch() -> u16;
+    fn _kbhit() -> i32;
+    fn SetConsoleOutputCP(page: u32) -> i32;
 }
+
+const UTF8_CODE_PAGE: u32 = 65001;
 
 const CLK_FREQ: u32 = 54000000;
 const CYCLES_PER_MS: u32 = CLK_FREQ / 1000;
@@ -61,17 +65,10 @@ class Emulator {
     tlb_keys: *mut u32,
     tlb_entries: *mut u32,
     timer_compare: u32,
-    flash_selected: bool,
-    flash_write_enabled: bool,
-    flash_read_warned: bool,
-    flash_command: u8,
-    flash_rx: u8,
-    flash_count: u32,
-    flash_address: u32,
-    flash_paths: Vector<String>,
-    flash_offsets: Vector<u32>,
-    flash_sizes: Vector<u32>,
-    esp: Esp01;
+    esp: ESP01,
+    output_pending: String,
+    output_needed: u32,
+    pub sd: SDCard;
 
     Emulator(&mut this, quiet: bool) {
         this.quiet = quiet;
@@ -118,7 +115,7 @@ class Emulator {
         for line in content.Split('\n') {
             if line.Empty() { continue; }
             let word = line.Strip().ToInteger(16).Unwrap() as u32;
-            this.WriteWord(address + offset, word);
+            this.LoadWord(address + offset, word);
             offset += 4;
         }
 
@@ -133,17 +130,22 @@ class Emulator {
         loop {
             let mut word: u32 = 0;
             if !file.ReadWords(&mut word, 1) { break; }
-            this.WriteWord(address + offset, ByteSwap32(word));
+            this.LoadWord(address + offset, ByteSwap32(word));
             offset += 4;
         }
 
-        if (address & 0xC0000000) == 0x80000000 {
-            this.flash_paths.PushBack(path);
-            this.flash_offsets.PushBack(address & 0x7FFFFF);
-            this.flash_sizes.PushBack(offset);
-        }
-
         true
+    }
+
+    fn LoadWord(&mut this, address: u32, value: u32) {
+        if (address & 0xC0000000) == 0x80000000 {
+            this.flash[(address & 0x7FFFFF) as usize] = (value & 0xFF) as u8;
+            this.flash[((address + 1) & 0x7FFFFF) as usize] = ((value >> 8) & 0xFF) as u8;
+            this.flash[((address + 2) & 0x7FFFFF) as usize] = ((value >> 16) & 0xFF) as u8;
+            this.flash[((address + 3) & 0x7FFFFF) as usize] = ((value >> 24) & 0xFF) as u8;
+        } else {
+            this.WriteWord(address, value);
+        }
     }
 
     pub fn Reset(&mut this) {
@@ -154,9 +156,8 @@ class Emulator {
         (this.page_table_base, this.address_space) = (0, 0);
         this.FlushTLB();
         this.timer_compare = 0;
-        (this.flash_selected, this.flash_write_enabled, this.flash_read_warned) = (false, false, false);
-        (this.flash_command, this.flash_rx, this.flash_count, this.flash_address) = (0, 0, 0, 0);
         this.esp.Reset();
+        this.sd.Reset();
 
         for i in 0..32 {
             this.registers[i as usize] = 0;
@@ -174,101 +175,11 @@ class Emulator {
     }
 
     fn IsDevice(&this, address: u32) -> bool {
-        address == 0xFFFF || address == 0xFFFC || address == 0xFFF4 || address == 0xFFEC || address == 0xFFE8 || address == 0xFFE4 || address == 0xFFDC || address == 0xFFD8 || address == 0xFFD4 ||
-            address == 0xFFC8 || address == 0xFFC4 || address == 0xFFC0 || address == 0xFFBC
+        address == 0xFFFF || address == 0xFFFC || address == 0xFFF4 || address == 0xFFEC || address == 0xFFE8 || address == 0xFFE4 || address == 0xFFDC ||
+            address == 0xFFC8 || address == 0xFFC4 || address == 0xFFC0 || address == 0xFFBC || address == 0xFFB8 || address == 0xFFB4 || address == 0xFFB0
     }
 
-    fn SelectFlash(&mut this, selected: bool) {
-        if selected && !this.flash_selected {
-            (this.flash_command, this.flash_count, this.flash_address) = (0, 0, 0);
-        } else if !selected && this.flash_selected {
-            this.FinishFlashCommand();
-        }
-
-        this.flash_selected = selected;
-    }
-
-    fn FinishFlashCommand(&mut this) {
-        let command = this.flash_command;
-
-        if command == 0x06 && this.flash_count == 1 {
-            this.flash_write_enabled = true;
-        } else if command == 0x04 {
-            this.flash_write_enabled = false;
-        } else if command == 0x20 && this.flash_count == 4 && this.flash_write_enabled {
-            let sector = this.flash_address & 0x7FF000;
-            let mut i: u32 = 0;
-
-            while i < 4096 {
-                this.flash[(sector + i) as usize] = 0xFF;
-                i += 1;
-            }
-
-            this.flash_write_enabled = false;
-            this.SaveFlash(sector, 4096);
-        } else if command == 0x02 && this.flash_count > 4 && this.flash_write_enabled {
-            this.flash_write_enabled = false;
-            this.SaveFlash(this.flash_address & 0x7FFF00, 256);
-        }
-    }
-
-    fn TransferFlashByte(&mut this, value: u8) {
-        if !this.flash_selected {
-            return;
-        }
-
-        let (command, count) = (this.flash_command, this.flash_count);
-        let mut result: u8 = 0xFF;
-
-        if count == 0 {
-            this.flash_command = value;
-        } else if count < 4 && (command == 0x03 || command == 0x20 || command == 0x02) {
-            this.flash_address = ((this.flash_address << 8) | value as u32) & 0xFFFFFF;
-        } else if command == 0x03 {
-            result = this.flash[(((this.flash_address + count - 4) & 0x7FFFFF) ^ 3) as usize];
-        } else if command == 0x02 {
-            if this.flash_write_enabled {
-                let address = (this.flash_address & 0x7FFF00) | ((this.flash_address + count - 4) & 0xFF);
-                this.flash[(address ^ 3) as usize] = this.flash[(address ^ 3) as usize] & value;
-            }
-        } else if command == 0x05 {
-            result = if this.flash_write_enabled { 2 } else { 0 };
-        } else if command == 0x9F {
-            result = if count == 1 { 0xEF } else if count == 2 { 0x40 } else { 0x17 };
-        }
-
-        this.flash_rx = result;
-        this.flash_count = count + 1;
-    }
-
-    fn SaveFlash(&mut this, start: u32, length: u32) {
-        for i in 0..this.flash_paths.Length() {
-            let offset = this.flash_offsets[i];
-
-            if start < offset || start + length > offset + this.flash_sizes[i] {
-                continue;
-            }
-
-            let mut file = _File(this.flash_paths[i]);
-
-            if !file.Open(FileMode::Update) || !file.Seek(start - offset) {
-                continue;
-            }
-
-            let mut address = start;
-
-            while address < start + length {
-                let mut word = this.flash[address as usize] as u32;
-                word |= this.flash[(address + 1) as usize] as u32 << 8;
-                word |= this.flash[(address + 2) as usize] as u32 << 16;
-                word |= this.flash[(address + 3) as usize] as u32 << 24;
-                file.WriteWord(ByteSwap32(word));
-                address += 4;
-            }
-        }
-    }
-
-    fn IsUartReady(&mut this) -> bool {
+    fn IsUARTReady(&mut this) -> bool {
         this.uart_mutex.Lock();
         let ready = this.uart_rx_ready;
         this.uart_mutex.Unlock();
@@ -276,7 +187,7 @@ class Emulator {
     }
 
     fn GetPendingInterrupts(&mut this, mask: u32) -> u32 {
-        let uart: u32 = if (mask & 2) != 0 && this.IsUartReady() { 2 } else { 0 };
+        let uart: u32 = if (mask & 2) != 0 && this.IsUARTReady() { 2 } else { 0 };
         let timer: u32 = if (mask & 1) != 0 && ((this.cycle_counter as u32 - this.timer_compare) as i32) >= 0 { 1 } else { 0 };
         let esp: u32 = if (mask & 4) != 0 && this.esp.HasByte(this.cycle_counter) { 4 } else { 0 };
         esp | uart | timer
@@ -449,17 +360,18 @@ class Emulator {
                 this.uart_mutex.Unlock();
                 result * 0x01010101
             },
-            0xFFFC => if this.IsUartReady() { 1 } else { 0 },
+            0xFFFC => if this.IsUARTReady() { 1 } else { 0 },
             0xFFF4 => 0,
             0xFFE8 => this.cycle_counter as u32,
             0xFFE4 => this.instruction_counter,
             0xFFDC => this.timer_compare,
-            0xFFD8 => this.flash_rx as u32,
-            0xFFD4 => if this.flash_selected { 1 } else { 0 },
             0xFFC8 => this.esp.ReadByte(this.cycle_counter),
             0xFFC4 => this.esp.Status(this.cycle_counter),
             0xFFC0 => this.esp.divisor,
             0xFFBC => this.esp.control,
+            0xFFB8 => this.sd.Received() as u32,
+            0xFFB4 => this.sd.PortStatus(),
+            0xFFB0 => this.sd.divisor,
             _ => (this.cycle_counter / CYCLES_PER_MS as u64) as u32
         }
     }
@@ -468,11 +380,6 @@ class Emulator {
         if this.IsDevice(address) {
             ((this.ReadDevice(address) >> (8 * (address & 3))) & 0xFF) as u8
         } else if (address & 0xC0000000) == 0x80000000 {
-            if this.flash_selected && !this.flash_read_warned {
-                WriteLine("[Flash: read while CS is held by the software]");
-                this.flash_read_warned = true;
-            }
-
             this.flash[(address & 0x7FFFFF) as usize]
         } else if (address & 0xC0000000) == 0x40000000 {
             this.sdram[(address & 0x7FFFFF) as usize]
@@ -507,17 +414,21 @@ class Emulator {
 
     fn WriteByte(&mut this, address: u32, value: u8) {
         if address == 0xFFFF {
-            Write((value as i8).ToString());
+            this.WriteOutput(value);
         } else if address == 0xFFC8 {
             this.esp.WriteByte(value, this.cycle_counter);
         } else if address == 0xFFBC {
             this.esp.SetControl(value as u32, this.cycle_counter);
+        } else if address == 0xFFB8 {
+            this.sd.Transfer(value);
+        } else if address == 0xFFB4 {
+            this.sd.SetControl(value as u32);
+        } else if address == 0xFFB0 {
+            this.sd.divisor = if value == 0 { 1 } else { value as u32 };
         } else if address == 0xFFF0 {
             if !this.quiet {
                 WriteLine("[LEDs: 0x" + String::FromInteger(value as u64, 16) + ']');
             }
-        } else if (address & 0xC0000000) == 0x80000000 {
-            this.flash[(address & 0x7FFFFF) as usize] = value;
         } else if (address & 0xC0000000) == 0x40000000 {
             this.sdram[(address & 0x7FFFFF) as usize] = value;
         } else if address < 16384 {
@@ -547,12 +458,6 @@ class Emulator {
             },
             0xFFC0 => {
                 this.esp.divisor = value & 0xFFFF;
-            },
-            0xFFD4 => {
-                this.SelectFlash((value & 1) != 0);
-            },
-            0xFFD8 => {
-                this.TransferFlashByte((value & 0xFF) as u8);
             },
             _ => {
                 this.WriteByte(address, (value & 0xFF) as u8);
@@ -610,7 +515,7 @@ class Emulator {
         } else { 0 };
 
         if interrupts != 0 {
-            this.Trap(if (interrupts & 1) != 0 { TrapCause::Timer as u32 } else if (interrupts & 2) != 0 { TrapCause::Uart as u32 } else { TrapCause::Esp as u32 }, this.pc, 0);
+            this.Trap(if (interrupts & 1) != 0 { TrapCause::Timer as u32 } else if (interrupts & 2) != 0 { TrapCause::UART as u32 } else { TrapCause::ESP as u32 }, this.pc, 0);
         }
 
         let mut fetch_address: u32 = 0;
@@ -865,6 +770,51 @@ class Emulator {
         this.instruction_counter += 1;
     }
 
+    fn WriteOutput(&mut this, value: u8) {
+        if (value & 0xC0) == 0x80 && this.output_needed > 0 {
+            this.output_pending += value as i8;
+            this.output_needed -= 1;
+
+            if this.output_needed == 0 {
+                Write(this.output_pending);
+                this.output_pending.Clear();
+            }
+
+            return;
+        }
+
+        if !this.output_pending.Empty() {
+            Write(this.output_pending);
+            this.output_pending.Clear();
+        }
+
+        this.output_needed = if value >= 0xF0 && value < 0xF8 { 3 } else if value >= 0xE0 && value < 0xF0 { 2 } else if value >= 0xC0 && value < 0xE0 { 1 } else { 0 };
+
+        if this.output_needed > 0 {
+            this.output_pending += value as i8;
+        } else {
+            Write((value as i8).ToString());
+        }
+    }
+
+    fn ReceiveCode(&mut this, code: u32) {
+        if code < 0x80 {
+            this.Receive(code as u8);
+        } else if code < 0x800 {
+            this.Receive((0xC0 | (code >> 6)) as u8);
+            this.Receive((0x80 | (code & 0x3F)) as u8);
+        } else if code < 0x10000 {
+            this.Receive((0xE0 | (code >> 12)) as u8);
+            this.Receive((0x80 | ((code >> 6) & 0x3F)) as u8);
+            this.Receive((0x80 | (code & 0x3F)) as u8);
+        } else {
+            this.Receive((0xF0 | (code >> 18)) as u8);
+            this.Receive((0x80 | ((code >> 12) & 0x3F)) as u8);
+            this.Receive((0x80 | ((code >> 6) & 0x3F)) as u8);
+            this.Receive((0x80 | (code & 0x3F)) as u8);
+        }
+    }
+
     fn Receive(&mut this, character: u8) {
         this.uart_mutex.Lock();
 
@@ -885,12 +835,12 @@ class Emulator {
         }
     }
 
-    fn UartThread(&mut this) {
+    fn UARTThread(&mut this) {
         loop {
-            let character = _getch();
+            let character = _getwch() as u32;
 
-            if character == 0 || character == 0xE0 {
-                match _getch() {
+            if character == 0 || (character == 0xE0 && _kbhit() != 0) {
+                match _getwch() as u32 {
                     0x48 => this.Receive("\x1B[A"),
                     0x50 => this.Receive("\x1B[B"),
                     0x4D => this.Receive("\x1B[C"),
@@ -900,14 +850,18 @@ class Emulator {
                     0x53 => this.Receive("\x1B[3~"),
                     _ => ()
                 }
+            } else if character >= 0xD800 && character < 0xDC00 {
+                let low = _getwch() as u32;
+                this.ReceiveCode(0x10000 + ((character - 0xD800) << 10) + (low & 0x3FF));
             } else {
-                this.Receive(character as u8);
+                this.ReceiveCode(character);
             }
         }
     }
 
     pub fn Emulate(&mut this) {
-        let mut uart_thread = Thread(Emulator::UartThread as ThreadFunction, this);
+        SetConsoleOutputCP(UTF8_CODE_PAGE);
+        let mut uart_thread = Thread(Emulator::UARTThread as ThreadFunction, this);
         uart_thread.Detach();
 
         while !this.halted {

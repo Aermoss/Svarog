@@ -29,15 +29,14 @@ module cpu #(
     output logic esp_enable,
     output logic esp_reset_n,
 
+    output logic sd_clk,
+    output logic sd_mosi,
+    input logic sd_miso,
+    output logic sd_cs_n,
+
     input logic button,
     output logic [5:0] leds,
     output logic ws2812,
-
-    output logic flash_raw_enable,
-    output logic flash_raw_start,
-    output logic [7:0] flash_raw_tx,
-    input logic [7:0] flash_raw_rx,
-    input logic flash_raw_busy,
 
     output logic video_write,
     output logic [11:0] video_address,
@@ -544,77 +543,36 @@ module cpu #(
 
     logic [3:0] uart_we;
     logic [15:0] uart_clks_per_bit;
-
-    logic uart_tx_busy;
-    logic uart_tx_started;
-    logic uart_tx_write;
-
-    assign uart_tx_write = (mem_addr == 32'hFFFF) && (io_we != 0) && !uart_tx_busy && !uart_tx_started;
-
-    always_ff @(posedge clk or posedge rst) begin
-        if (rst)
-            uart_tx_started <= 0;
-        else if (uart_tx_write)
-            uart_tx_started <= 1;
-        else
-            uart_tx_started <= 0;
-    end
-
-    generate
-        if (SIMULATION) begin : sim_uart
-            always_ff @(posedge clk) begin
-                if (uart_we[0]) $write("%c", mem_write[7:0]);
-                if (uart_we[1]) $write("%c", mem_write[15:8]);
-                if (uart_we[2]) $write("%c", mem_write[23:16]);
-                if (uart_we[3]) $write("%c", mem_write[31:24]);
-            end
-
-            assign uart_tx_busy = 1'b0;
-            assign uart_tx = 1'b1;
-        end else begin : hw_uart
-            logic [7:0] uart_tx_data;
-
-            always_comb begin
-                if (uart_we[3]) uart_tx_data = mem_write[31:24];
-                else if (uart_we[2]) uart_tx_data = mem_write[23:16];
-                else if (uart_we[1]) uart_tx_data = mem_write[15:8];
-                else uart_tx_data = mem_write[7:0];
-            end
-
-            uart_tx uart_tx0 (
-                .clk(clk),
-                .rst(rst),
-                .clks_per_bit(uart_clks_per_bit),
-                .tx_data(uart_tx_data),
-                .tx_write(uart_tx_write),
-                .tx_busy(uart_tx_busy),
-                .tx_pin(uart_tx)
-            );
-        end
-    endgenerate
-
+    logic [7:0] uart_tx_data;
     logic [7:0] uart_rx_byte;
     logic uart_rx_ready;
+    logic uart_tx_busy;
 
-    uart_rx uart_rx0 (
+    always_comb begin
+        if (uart_we[3]) uart_tx_data = mem_write[31:24];
+        else if (uart_we[2]) uart_tx_data = mem_write[23:16];
+        else if (uart_we[1]) uart_tx_data = mem_write[15:8];
+        else uart_tx_data = mem_write[7:0];
+    end
+
+    uart #(
+        .CLK_FREQ(CLK_FREQ),
+        .ECHO(SIMULATION)
+    ) console_uart0 (
         .clk(clk),
         .rst(rst),
-        .clks_per_bit(uart_clks_per_bit),
+        .write(mem_addr == 32'hFFFF && io_we != 0),
+        .write_data(uart_tx_data),
+        .read(mem_addr == 32'hFFFF && io_read),
+        .read_data(uart_rx_byte),
+        .rx_ready(uart_rx_ready),
+        .tx_busy(uart_tx_busy),
+        .divisor_write(mem_addr == 32'hFFF8 && io_we != 0),
+        .divisor_data(mem_write[15:0]),
+        .divisor(uart_clks_per_bit),
         .rx_pin(uart_rx),
-        .read_ack(mem_addr == 32'hFFFF && io_read),
-        .rx_byte(uart_rx_byte),
-        .rx_ready(uart_rx_ready)
+        .tx_pin(uart_tx)
     );
-
-    localparam int UART_DEFAULT_BAUD_RATE = 115200;
-    localparam int UART_DEFAULT_CLKS_PER_BIT = CLK_FREQ / UART_DEFAULT_BAUD_RATE;
-
-    always_ff @(posedge clk or posedge rst) begin
-        if (rst)
-            uart_clks_per_bit <= UART_DEFAULT_CLKS_PER_BIT;
-        else if (mem_addr == 32'hFFF8 && io_we != 0)
-            uart_clks_per_bit <= mem_write[15:0];
-    end
 
     logic [31:0] ms_counter;
     logic [21:0] tick_divider;
@@ -682,16 +640,6 @@ module cpu #(
             leds <= mem_write[5:0];
     end
 
-    always_ff @(posedge clk or posedge rst) begin
-        if (rst)
-            flash_raw_enable <= 0;
-        else if (mem_addr == 32'hFFD4 && io_we != 0)
-            flash_raw_enable <= mem_write[0];
-    end
-
-    assign flash_raw_start = mem_addr == 32'hFFD8 && io_we != 0;
-    assign flash_raw_tx = mem_write[7:0];
-
     logic in_text_window;
 
     assign in_text_window = mem_addr[31:14] == 18'd2;
@@ -710,9 +658,9 @@ module cpu #(
         end
     end
 
-    ws2812_tx #(
+    ws2812 #(
         .CLK_FREQ(CLK_FREQ)
-    ) ws2812_tx0 (
+    ) ws2812_0 (
         .clk(clk),
         .rst(rst),
         .strobe(mem_addr == 32'hFFE0 && io_we != 0),
@@ -754,14 +702,37 @@ module cpu #(
         end
     end
 
+    logic [7:0] spi_read_data;
+    logic [4:0] spi_status;
+    logic [7:0] spi_divisor;
+
+    spi sd_spi0 (
+        .clk(clk),
+        .rst(rst),
+        .data_write(mem_addr == 32'hFFB8 && io_we != 0),
+        .write_data(mem_write[7:0]),
+        .read_data(spi_read_data),
+        .control_write(mem_addr == 32'hFFB4 && io_we != 0),
+        .control_data(mem_write[4:0]),
+        .status(spi_status),
+        .divisor_write(mem_addr == 32'hFFB0 && io_we != 0),
+        .divisor_data(mem_write[7:0]),
+        .divisor(spi_divisor),
+        .sclk(sd_clk),
+        .mosi(sd_mosi),
+        .miso(sd_miso),
+        .cs_n(sd_cs_n)
+    );
+
     always_comb begin
         uart_we = 0;
         actual_mem_we = 0;
 
         if (mem_addr == 32'hFFFF)
             uart_we = io_we;
-        else if (mem_addr != 32'hFFF0 && mem_addr != 32'hFFE0 && mem_addr != 32'hFFEC && mem_addr != 32'hFFF4 && mem_addr != 32'hFFF8 && mem_addr != 32'hFFE8 && mem_addr != 32'hFFE4 && mem_addr != 32'hFFDC && mem_addr != 32'hFFD8 && mem_addr != 32'hFFD4 && mem_addr != 32'hFFD0 && mem_addr != 32'hFFCC &&
-                mem_addr != 32'hFFC8 && mem_addr != 32'hFFC4 && mem_addr != 32'hFFC0 && mem_addr != 32'hFFBC && !in_text_window)
+        else if (mem_addr != 32'hFFF0 && mem_addr != 32'hFFE0 && mem_addr != 32'hFFEC && mem_addr != 32'hFFF4 && mem_addr != 32'hFFF8 && mem_addr != 32'hFFE8 && mem_addr != 32'hFFE4 && mem_addr != 32'hFFDC && mem_addr != 32'hFFD0 && mem_addr != 32'hFFCC &&
+                mem_addr != 32'hFFC8 && mem_addr != 32'hFFC4 && mem_addr != 32'hFFC0 && mem_addr != 32'hFFBC && mem_addr != 32'hFFB8 && mem_addr != 32'hFFB4 &&
+                mem_addr != 32'hFFB0 && !in_text_window)
             actual_mem_we = mem_we;
     end
 
@@ -1037,14 +1008,15 @@ module cpu #(
             32'hFFE8: io_read_word = cycle_counter;
             32'hFFE4: io_read_word = instret_counter;
             32'hFFDC: io_read_word = timer_compare;
-            32'hFFD8: io_read_word = {24'b0, flash_raw_rx};
-            32'hFFD4: io_read_word = {30'b0, flash_raw_busy, flash_raw_enable};
             32'hFFD0: io_read_word = {16'b0, video_cursor};
             32'hFFCC: io_read_word = {27'b0, video_scroll};
             32'hFFC8: io_read_word = {24'b0, esp_read_data};
             32'hFFC4: io_read_word = {30'b0, esp_tx_busy, esp_rx_ready};
             32'hFFC0: io_read_word = {16'b0, esp_divisor};
             32'hFFBC: io_read_word = {30'b0, esp_reset_n, esp_enable};
+            32'hFFB8: io_read_word = {24'b0, spi_read_data};
+            32'hFFB4: io_read_word = {27'b0, spi_status};
+            32'hFFB0: io_read_word = {24'b0, spi_divisor};
             default: begin
                 io_read_word = 0;
                 io_read_hit = stage_mem_addr[31:14] == 18'd2;

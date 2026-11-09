@@ -429,8 +429,8 @@ class Assembler {
             let label = this.RelocationSymbol(operands[1]->expression);
             this.WriteWord(this.section, (Opcode::AUIPC as u32 << OPCODE_SHIFT) | (register << REG0_SHIFT) | (0 & IMM21_MASK));
             this.WriteWord(this.section, (Opcode::ADDI as u32 << OPCODE_SHIFT) | (register << REG0_SHIFT) | (register << REG1_SHIFT) | (0 & IMM16_MASK));
-            this.relocations.PushBack(Relocation(this.section, offset, RelocationType::PcRelativeUpper21, label));
-            this.relocations.PushBack(Relocation(this.section, offset + 4, RelocationType::PcRelativeLower11, label));
+            this.relocations.PushBack(Relocation(this.section, offset, RelocationType::PCRelativeUpper21, label));
+            this.relocations.PushBack(Relocation(this.section, offset + 4, RelocationType::PCRelativeLower11, label));
             return;
         }
 

@@ -41,8 +41,8 @@ enum TrapCause: u32 {
     StoreFault = 0x00000007,
     SystemCall = 0x00000008,
     Timer = 0x80000000,
-    Uart = 0x80000001,
-    Esp = 0x80000002
+    UART = 0x80000001,
+    ESP = 0x80000002
 }
 
 const STATUS_IE: u32 = 1;

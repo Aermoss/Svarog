@@ -35,7 +35,7 @@ boot.hex: bin/svarog-ld.exe boot.o
 	$^ -o $@ --format=hex
 
 program.s: program.zir
-	$(COMPILER) $< -o $@ -S -target svarog -emit-hir -emit-mir -emit-lir
+	$(COMPILER) $< -o $@ -S -target svarog -ffreestanding -emit-hir -emit-mir -emit-lir
 
 program.bin: bin/svarog-ld.exe start.o program.o end.o
 	$^ -o $@ --format=bin --origin=0x40000000

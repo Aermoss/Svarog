@@ -22,21 +22,21 @@ const ESP_CYCLES_PER_MS: u64 = 54000;
 const ESP_NETWORK_COUNT: usize = 3;
 const ESP_NTP_UNIX_OFFSET: u32 = 2208988800;
 
-class EspNetwork {
+class ESPNetwork {
     pub ssid: String,
     pub bssid: String,
     pub rssi: i32,
     pub channel: u32,
     pub encryption: u32;
 
-    EspNetwork(&mut this) {}
+    ESPNetwork(&mut this) {}
 
-    EspNetwork(&mut this, ssid: *i8, bssid: *i8, rssi: i32, channel: u32, encryption: u32) {
+    ESPNetwork(&mut this, ssid: *i8, bssid: *i8, rssi: i32, channel: u32, encryption: u32) {
         (this.ssid, this.bssid, this.rssi, this.channel, this.encryption) = (ssid.ToString(), bssid.ToString(), rssi, channel, encryption);
     }
 }
 
-class Esp01 {
+class ESP01 {
     pub control: u32 = 0,
     pub divisor: u32 = 468,
     echo: bool = true,
@@ -53,12 +53,12 @@ class Esp01 {
     link_port: u32 = 0,
     send_remaining: u32 = 0,
     send_data: Vector<u8>,
-    networks: Vector<EspNetwork>;
+    networks: Vector<ESPNetwork>;
 
-    Esp01(&mut this) {
-        this.networks.PushBack(EspNetwork("Svarog", "5c:cf:7f:10:20:30", -42, 6, 3));
-        this.networks.PushBack(EspNetwork("Triglav Guest", "5c:cf:7f:40:50:60", -67, 11, 0));
-        this.networks.PushBack(EspNetwork("Zircon-5G", "a4:2b:b0:70:80:90", -80, 1, 4));
+    ESP01(&mut this) {
+        this.networks.PushBack(ESPNetwork("Svarog", "5c:cf:7f:10:20:30", -42, 6, 3));
+        this.networks.PushBack(ESPNetwork("Triglav Guest", "5c:cf:7f:40:50:60", -67, 11, 0));
+        this.networks.PushBack(ESPNetwork("Zircon-5G", "a4:2b:b0:70:80:90", -80, 1, 4));
     }
 
     pub fn Reset(&mut this) {
@@ -333,7 +333,7 @@ class Esp01 {
         address
     }
 
-    fn DnsReply(&mut this, cycle: u64) {
+    fn DNSReply(&mut this, cycle: u64) {
         let query = this.send_data;
         let mut name = String();
         let mut offset: usize = 12;
@@ -389,7 +389,7 @@ class Esp01 {
         this.QueueBytes(reply, cycle, 40);
     }
 
-    fn HttpReply(&mut this, cycle: u64) {
+    fn HTTPReply(&mut this, cycle: u64) {
         let mut request = String();
 
         for value in this.send_data {
@@ -477,12 +477,12 @@ class Esp01 {
         this.Queue("\r\nRecv " + String::FromInteger(length as u64, 10) + " bytes\r\n\r\nSEND OK\r\n", cycle, 10);
 
         if this.link_tcp {
-            this.HttpReply(cycle);
+            this.HTTPReply(cycle);
             return;
         }
 
         if this.link_port == 53 {
-            this.DnsReply(cycle);
+            this.DNSReply(cycle);
             return;
         }
 

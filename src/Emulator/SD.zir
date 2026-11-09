@@ -1,0 +1,306 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/str", "std/vec", "std/file" : *]
+
+const SD_BLOCK_SIZE: usize = 512;
+const SD_IDLE: u8 = 0x01;
+const SD_ILLEGAL_COMMAND: u8 = 0x04;
+const SD_ADDRESS_ERROR: u8 = 0x20;
+const SD_INITIALIZE_POLLS: u32 = 3;
+
+enum SDState: u32 {
+    Command, Reading, WaitingForBlock, ReceivingBlock
+}
+
+class SDCard {
+    pub divisor: u32 = 68,
+    present: bool = false,
+    file: FileHandle,
+    sectors: u32 = 0,
+    selected: bool = false,
+    mode: u32 = 0,
+    received: u8 = 0xFF,
+    idle: bool = true,
+    application: bool = false,
+    initialize_polls: u32 = 0,
+    state: SDState = SDState::Command,
+    multiple: bool = false,
+    address: u32 = 0,
+    command: Vector<u8>,
+    output: Vector<u8>,
+    read_index: usize = 0,
+    block: Vector<u8>;
+
+    SDCard(&mut this) {}
+
+    pub fn Open(&mut this, path: &String) -> bool {
+        match FileHandle::Open(path, FileMode::Update) {
+            Result<FileHandle, IOError>::Ok(handle) => {
+                this.file = handle;
+            },
+            Result<FileHandle, IOError>::Err(_) => {
+                return false;
+            }
+        }
+
+        let size = this.file.Size().UnwrapOr(0);
+        this.sectors = (size / SD_BLOCK_SIZE) as u32;
+        this.present = this.sectors > 0;
+        this.present
+    }
+
+    pub fn Reset(&mut this) {
+        (this.divisor, this.selected, this.received, this.mode) = (68, false, 0xFF, 0);
+        (this.idle, this.application, this.initialize_polls) = (true, false, 0);
+        this.Finish();
+    }
+
+    fn Finish(&mut this) {
+        (this.state, this.multiple, this.read_index) = (SDState::Command, false, 0);
+        this.command.Clear();
+        this.output.Clear();
+        this.block.Clear();
+    }
+
+    pub fn PortStatus(&this) -> u32 {
+        this.mode | (if this.selected { 1 } else { 0 })
+    }
+
+    pub fn SetControl(&mut this, value: u32) {
+        this.mode = value & 0x1C;
+        this.Select((value & 1) != 0);
+    }
+
+    pub fn Received(&this) -> u8 {
+        this.received
+    }
+
+    pub fn Select(&mut this, selected: bool) {
+        if !selected && this.selected && this.state != SDState::Reading {
+            this.command.Clear();
+        }
+
+        this.selected = selected;
+    }
+
+    fn Push(&mut this, value: u8) {
+        this.output.PushBack(value);
+    }
+
+    fn PushWord(&mut this, value: u32) {
+        this.Push(((value >> 24) & 0xFF) as u8);
+        this.Push(((value >> 16) & 0xFF) as u8);
+        this.Push(((value >> 8) & 0xFF) as u8);
+        this.Push((value & 0xFF) as u8);
+    }
+
+    fn Status(&this) -> u8 {
+        if this.idle { SD_IDLE } else { 0 }
+    }
+
+    fn ReadSector(&mut this, sector: u32, buffer: *mut u8) -> bool {
+        this.file.Seek((sector as usize * SD_BLOCK_SIZE) as isize, SeekOrigin::Start).IsOk() &&
+            this.file.Read(buffer, SD_BLOCK_SIZE).UnwrapOr(0) == SD_BLOCK_SIZE
+    }
+
+    fn WriteSector(&mut this, sector: u32, data: *u8) -> bool {
+        this.file.Seek((sector as usize * SD_BLOCK_SIZE) as isize, SeekOrigin::Start).IsOk() &&
+            this.file.Write(data, SD_BLOCK_SIZE).UnwrapOr(0) == SD_BLOCK_SIZE
+    }
+
+    fn QueueBlock(&mut this) {
+        let mut data: [u8; 512];
+
+        if this.address >= this.sectors || !this.ReadSector(this.address, &mut data[0]) {
+            this.Push(0x08);
+            this.state = SDState::Command;
+            return;
+        }
+
+        this.Push(0xFF);
+        this.Push(0xFE);
+
+        for i in 0..SD_BLOCK_SIZE {
+            this.Push(data[i]);
+        }
+
+        this.Push(0xFF);
+        this.Push(0xFF);
+        this.address += 1;
+    }
+
+    fn QueueRegister(&mut this) {
+        let size = this.sectors / 1024 - 1;
+        this.Push(0x00);
+        this.Push(0xFF);
+        this.Push(0xFE);
+        this.PushWord(0x400E0032);
+        this.PushWord(0x5B590000 | ((size >> 16) & 0x3F));
+        this.PushWord(((size & 0xFFFF) << 16) | 0x7F80);
+        this.PushWord(0x0A400001);
+        this.Push(0xFF);
+        this.Push(0xFF);
+    }
+
+    fn Execute(&mut this) {
+        let index = this.command[0] & 0x3F;
+        let argument = (this.command[1] as u32 << 24) | (this.command[2] as u32 << 16) | (this.command[3] as u32 << 8) | this.command[4] as u32;
+        let application = this.application;
+        this.application = false;
+        this.command.Clear();
+        this.Push(0xFF);
+
+        if application && index == 41 {
+            this.initialize_polls += 1;
+
+            if this.initialize_polls >= SD_INITIALIZE_POLLS {
+                this.idle = false;
+            }
+
+            this.Push(this.Status());
+            return;
+        }
+
+        match index {
+            0 => {
+                (this.idle, this.initialize_polls) = (true, 0);
+                this.Push(SD_IDLE);
+            },
+            8 => {
+                this.Push(this.Status());
+                this.PushWord(argument & 0xFFF);
+            },
+            55 => {
+                this.application = true;
+                this.Push(this.Status());
+            },
+            58 => {
+                this.Push(this.Status());
+                this.PushWord(if this.idle { 0x00FF8000 } else { 0xC0FF8000 });
+            },
+            9 => {
+                this.QueueRegister();
+            },
+            12 => {
+                this.state = SDState::Command;
+                this.output.Clear();
+                this.read_index = 0;
+                this.Push(0xFF);
+                this.Push(0x00);
+                this.Push(0x00);
+            },
+            13 => {
+                this.Push(this.Status());
+                this.Push(0x00);
+            },
+            16 => {
+                this.Push(this.Status());
+            },
+            17 | 18 => {
+                if this.idle {
+                    this.Push(SD_IDLE | SD_ILLEGAL_COMMAND);
+                } else if argument >= this.sectors {
+                    this.Push(SD_ADDRESS_ERROR);
+                } else {
+                    this.Push(0x00);
+                    (this.address, this.multiple) = (argument, index == 18);
+                    this.QueueBlock();
+                    this.state = if this.multiple { SDState::Reading } else { SDState::Command };
+                }
+            },
+            24 | 25 => {
+                if this.idle {
+                    this.Push(SD_IDLE | SD_ILLEGAL_COMMAND);
+                } else if argument >= this.sectors {
+                    this.Push(SD_ADDRESS_ERROR);
+                } else {
+                    this.Push(0x00);
+                    (this.address, this.multiple, this.state) = (argument, index == 25, SDState::WaitingForBlock);
+                }
+            },
+            _ => {
+                this.Push(this.Status() | SD_ILLEGAL_COMMAND);
+            }
+        }
+    }
+
+    fn ReceiveBlockByte(&mut this, value: u8) {
+        this.block.PushBack(value);
+
+        if this.block.Length() < SD_BLOCK_SIZE + 2 {
+            return;
+        }
+
+        let written = this.address < this.sectors && this.WriteSector(this.address, this.block.Data());
+        this.block.Clear();
+        this.address += 1;
+        this.Push(if written { 0xE5 } else { 0xED });
+        this.Push(0x00);
+        this.Push(0x00);
+        this.state = if this.multiple && written { SDState::WaitingForBlock } else { SDState::Command };
+    }
+
+    pub fn Transfer(&mut this, value: u8) {
+        if !this.present || !this.selected {
+            this.received = 0xFF;
+            return;
+        }
+
+        this.received = if this.read_index < this.output.Length() { this.output[this.read_index] } else { 0xFF };
+
+        if this.read_index < this.output.Length() {
+            this.read_index += 1;
+
+            if this.read_index == this.output.Length() {
+                this.output.Clear();
+                this.read_index = 0;
+            }
+        }
+
+        if this.state == SDState::WaitingForBlock {
+            if value == 0xFE || (value == 0xFC && this.multiple) {
+                this.state = SDState::ReceivingBlock;
+            } else if value == 0xFD && this.multiple {
+                this.state = SDState::Command;
+                this.Push(0xFF);
+                this.Push(0x00);
+                this.Push(0x00);
+            }
+
+            return;
+        }
+
+        if this.state == SDState::ReceivingBlock {
+            this.ReceiveBlockByte(value);
+            return;
+        }
+
+        if this.state == SDState::Reading && this.output.Empty() {
+            this.QueueBlock();
+        }
+
+        if this.command.Empty() && (value & 0xC0) != 0x40 {
+            return;
+        }
+
+        this.command.PushBack(value);
+
+        if this.command.Length() == 6 {
+            this.Execute();
+        }
+    }
+}
