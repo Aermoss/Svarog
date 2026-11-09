@@ -49,6 +49,7 @@ class Esp01 {
     read_index: usize = 0,
     last_time: u64 = 0,
     link_open: bool = false,
+    link_tcp: bool = false,
     link_port: u32 = 0,
     send_remaining: u32 = 0,
     send_data: Vector<u8>,
@@ -277,13 +278,213 @@ class Esp01 {
             return;
         }
 
-        (this.link_open, this.link_port) = (true, String::ToInteger(command.SubString(port_start), 10).UnwrapOr(0) as u32);
+        (this.link_open, this.link_tcp, this.link_port) = (true, kind == "TCP", String::ToInteger(command.SubString(port_start), 10).UnwrapOr(0) as u32);
         this.Queue("CONNECT\r\n\r\nOK\r\n", cycle, 100);
+    }
+
+    fn PushName(&this, bytes: &mut Vector<u8>, name: &String) {
+        for label in name.Split('.') {
+            bytes.PushBack(label.Length() as u8);
+
+            for i in 0..label.Length() {
+                bytes.PushBack(label[i] as u8);
+            }
+        }
+
+        bytes.PushBack(0);
+    }
+
+    fn PushRecord(&this, bytes: &mut Vector<u8>, pointer: usize, kind: u8, data: &Vector<u8>) {
+        bytes.PushBack((0xC0 | (pointer >> 8)) as u8);
+        bytes.PushBack(pointer as u8);
+        bytes.PushBack(0);
+        bytes.PushBack(kind);
+        bytes.PushBack(0);
+        bytes.PushBack(1);
+        bytes.PushBack(0);
+        bytes.PushBack(0);
+        bytes.PushBack(1);
+        bytes.PushBack(44);
+        bytes.PushBack((data.Length() >> 8) as u8);
+        bytes.PushBack(data.Length() as u8);
+
+        for value in data {
+            bytes.PushBack(value);
+        }
+    }
+
+    fn Address(&this, name: &String) -> Vector<u8> {
+        let mut address = Vector<u8>();
+
+        if name == "pool.ntp.org" {
+            (address.PushBack(162), address.PushBack(159), address.PushBack(200), address.PushBack(123));
+        } else if name == "example.com" {
+            (address.PushBack(93), address.PushBack(184), address.PushBack(215), address.PushBack(14));
+        } else {
+            let mut hash: u32 = 7;
+
+            for i in 0..name.Length() {
+                hash = hash * 31 + name[i] as u8 as u32;
+            }
+
+            (address.PushBack(203), address.PushBack(0), address.PushBack(113), address.PushBack((hash % 254 + 1) as u8));
+        }
+
+        address
+    }
+
+    fn DnsReply(&mut this, cycle: u64) {
+        let query = this.send_data;
+        let mut name = String();
+        let mut offset: usize = 12;
+
+        while offset < query.Length() && query[offset] != 0 {
+            let size = query[offset] as usize;
+
+            if offset + size + 1 > query.Length() {
+                return;
+            }
+
+            if !name.Empty() {
+                name += '.';
+            }
+
+            for i in 0..size {
+                name += query[offset + 1 + i] as i8;
+            }
+
+            offset += size + 1;
+        }
+
+        let question_end = offset + 5;
+
+        if offset < 13 || question_end > query.Length() {
+            return;
+        }
+
+        let mut reply = Vector<u8>();
+
+        for i in 0..question_end {
+            reply.PushBack(query[i]);
+        }
+
+        (reply[2], reply[3], reply[6], reply[7], reply[8], reply[9], reply[10], reply[11]) = (0x81, 0x80, 0, 0, 0, 0, 0, 0);
+
+        if name.EndsWith(".invalid") {
+            reply[3] = 0x83;
+        } else if name.StartsWith("www.") {
+            let target = name.SubString(4);
+            let mut encoded = Vector<u8>();
+            this.PushName(encoded, target);
+            let alias_data = reply.Length() + 12;
+            this.PushRecord(reply, 12, 5, encoded);
+            this.PushRecord(reply, alias_data, 1, this.Address(target));
+            reply[7] = 2;
+        } else {
+            this.PushRecord(reply, 12, 1, this.Address(name));
+            reply[7] = 1;
+        }
+
+        this.Queue("\r\n+IPD," + String::FromInteger(reply.Length() as u64, 10) + ":", cycle, 40);
+        this.QueueBytes(reply, cycle, 40);
+    }
+
+    fn HttpReply(&mut this, cycle: u64) {
+        let mut request = String();
+
+        for value in this.send_data {
+            request += value as i8;
+        }
+
+        let line = request.SubString(0, request.Find("\r\n").UnwrapOr(request.Length()));
+        let parts = line.Split(' ');
+
+        if parts.Length() < 3 || parts[0] != "GET" {
+            return;
+        }
+
+        let path = parts[1];
+        let mut status = "200 OK".ToString();
+        let mut body = Vector<u8>();
+        let mut declared: usize = 0;
+
+        if path == "/hello.txt" {
+            for character in "Hello from the Svarog emulator!\n".ToString() {
+                body.PushBack(character as u8);
+            }
+        } else if path.StartsWith("/size/") || path.StartsWith("/short/") {
+            let short = path.StartsWith("/short/");
+            let mut size = String::ToInteger(path.SubString(if short { 7 } else { 6 }), 10).UnwrapOr(0) as usize;
+
+            if size > 2000000 {
+                size = 2000000;
+            }
+
+            declared = size;
+
+            if short {
+                size /= 2;
+            }
+
+            for i in 0..size {
+                body.PushBack(if i % 64 == 63 { '\n' as u8 } else { ('a' as u8) + (i % 26) as u8 });
+            }
+        } else {
+            status = "404 Not Found".ToString();
+
+            for character in "not found\n".ToString() {
+                body.PushBack(character as u8);
+            }
+        }
+
+        if declared == 0 {
+            declared = body.Length();
+        }
+
+        let header = "HTTP/1.0 " + status + "\r\nContent-Type: text/plain\r\nContent-Length: " + String::FromInteger(declared as u64, 10) + "\r\n\r\n";
+        let mut response = Vector<u8>();
+
+        for character in header {
+            response.PushBack(character as u8);
+        }
+
+        for value in body {
+            response.PushBack(value);
+        }
+
+        let mut offset: usize = 0;
+        let mut delay: u64 = 40;
+
+        while offset < response.Length() {
+            let size = if response.Length() - offset > 1460 { 1460 } else { response.Length() - offset };
+            let mut chunk = Vector<u8>();
+
+            for i in 0..size {
+                chunk.PushBack(response[offset + i]);
+            }
+
+            this.Queue("\r\n+IPD," + String::FromInteger(size as u64, 10) + ":", cycle, delay);
+            this.QueueBytes(chunk, cycle, delay);
+            (offset, delay) = (offset + size, delay + 5);
+        }
+
+        this.Queue("CLOSED\r\n", cycle, delay);
+        this.link_open = false;
     }
 
     fn Sent(&mut this, cycle: u64) {
         let length = this.send_data.Length();
         this.Queue("\r\nRecv " + String::FromInteger(length as u64, 10) + " bytes\r\n\r\nSEND OK\r\n", cycle, 10);
+
+        if this.link_tcp {
+            this.HttpReply(cycle);
+            return;
+        }
+
+        if this.link_port == 53 {
+            this.DnsReply(cycle);
+            return;
+        }
 
         if this.link_port != 123 || length != 48 || (this.send_data[0] & 7) != 3 {
             return;

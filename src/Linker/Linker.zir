@@ -15,12 +15,13 @@
  */
 
 #[include "std/str", "std/vec", "src/Common/Object.zir", "src/Common/Archive.zir", "src/Common/Binary.zir", "src/Common/Logger.zir",
-    "src/Common/Instruction.zir", "src/Common/Section.zir", "src/Common/Symbol.zir", "src/Common/Relocation.zir" : *]
+    "src/Common/Instruction.zir", "src/Common/Section.zir", "src/Common/Symbol.zir", "src/Common/Relocation.zir",
+    "src/Common/NameIndex.zir" : *]
 
 class Linker {
     pub objects: Vector<Object>,
     pub archives: Vector<Archive>,
-    symbol_names: Vector<String>,
+    symbol_names: NameIndex,
     symbol_addresses: Vector<u32>,
     sections: Vector<Vector<u32>>,
     section_bases: Vector<u32>,
@@ -28,33 +29,28 @@ class Linker {
  
     pub fn Link(&mut this) -> Binary {
         loop {
-            let mut defined_symbols: Vector<String>;
+            let mut defined_symbols: NameIndex;
 
             for object in this.objects {
                 for symbol in object.symbols {
                     if symbol.binding == BindingType::Global {
-                        defined_symbols.PushBack(symbol.name);
+                        defined_symbols.Insert(symbol.name);
                     }
                 }
             }
 
-            let mut required_symbols: Vector<String>;
+            let mut required_symbols: NameIndex;
 
             for object in this.objects {
+                let mut object_symbols: NameIndex;
+
+                for symbol in object.symbols {
+                    object_symbols.Insert(symbol.name);
+                }
+
                 for relocation in object.relocations {
-                    let mut local = false;
-
-                    for symbol in object.symbols {
-                        if symbol.name == relocation.symbol {
-                            local = true;
-                            break;
-                        }
-                    }
-
-                    if !local && !defined_symbols.Contains(relocation.symbol) {
-                        if !required_symbols.Contains(relocation.symbol) {
-                            required_symbols.PushBack(relocation.symbol);
-                        }
+                    if !object_symbols.Contains(relocation.symbol) && !defined_symbols.Contains(relocation.symbol) {
+                        required_symbols.Insert(relocation.symbol);
                     }
                 }
             }
@@ -124,7 +120,7 @@ class Linker {
             let object = this.objects[i];
 
             for symbol in object.symbols {
-                this.symbol_addresses.PushBack(object.section_bases[symbol.section as usize] + symbol.offset);
+                let address = object.section_bases[symbol.section as usize] + symbol.offset;
                 let mut name = symbol.name;
 
                 match symbol.binding {
@@ -139,7 +135,11 @@ class Linker {
                     }
                 }
 
-                this.symbol_names.PushBack(name);
+                let count = this.symbol_names.Length();
+
+                if this.symbol_names.Insert(name) == count {
+                    this.symbol_addresses.PushBack(address);
+                }
             }
         }
 
@@ -147,10 +147,10 @@ class Linker {
             let object = this.objects[i];
 
             for relocation in object.relocations {
-                let mut symbol_index = this.symbol_names.Index(String::FromInteger(i as HostUnsigned) + ":" + relocation.symbol);
+                let mut symbol_index = this.symbol_names.Find(String::FromInteger(i as HostUnsigned) + ":" + relocation.symbol);
 
                 if symbol_index.IsNone() {
-                    symbol_index = this.symbol_names.Index(relocation.symbol);
+                    symbol_index = this.symbol_names.Find(relocation.symbol);
                 }
  
                 if symbol_index.IsNone() {
@@ -199,14 +199,14 @@ class Linker {
             }
         }
 
-        let mut entry_index = this.symbol_names.Index("_start".ToString());
+        let mut entry_index = this.symbol_names.Find("_start".ToString());
 
         if entry_index.IsNone() {
-            entry_index = this.symbol_names.Index("Main".ToString());
+            entry_index = this.symbol_names.Find("Main".ToString());
         }
 
         if entry_index.IsNone() {
-            entry_index = this.symbol_names.Index("__z4Main".ToString());
+            entry_index = this.symbol_names.Find("__z4Main".ToString());
         }
 
         if entry_index.IsSome() {
