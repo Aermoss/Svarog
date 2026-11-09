@@ -137,10 +137,11 @@ module dcache #(
             if (sdram_start)
                 issued <= 1'b1;
 
-            if (fill_write) begin
-                issued <= 1'b0;
+            if (fill_write)
                 fill_offset <= fill_offset + 1'b1;
-            end
+
+            if (fill_done)
+                issued <= 1'b0;
         end
     end
 endmodule

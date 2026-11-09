@@ -45,6 +45,7 @@ module bus (
 
     output logic sdram_start,
     output logic sdram_write,
+    output logic [1:0] sdram_length,
     output logic [20:0] sdram_address,
     output logic [31:0] sdram_data,
     output logic [3:0] sdram_dqm,
@@ -169,6 +170,7 @@ module bus (
     always_comb begin
         sdram_start = 1'b0;
         sdram_write = 1'b0;
+        sdram_length = 2'd0;
         sdram_address = sdram_word_addr;
         sdram_data = cpu_mem_write;
         sdram_dqm = 4'b0000;
@@ -184,11 +186,13 @@ module bus (
 
             S_DCACHE: begin
                 sdram_start = dcache_start;
+                sdram_length = 2'd3;
                 sdram_address = dcache_address;
             end
 
             S_ICACHE: begin
                 sdram_start = icache_start;
+                sdram_length = 2'd3;
                 sdram_address = icache_address;
             end
 

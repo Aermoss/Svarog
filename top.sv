@@ -190,6 +190,7 @@ module top (
     logic [31:0] sdrc_data_r;
     logic sdrc_init_done;
     logic sdrc_cmd_ack;
+    logic [7:0] sdrc_data_len;
 
     SDRAM_Controller_HS_Top sdrc0 (
         .O_sdram_clk(O_sdram_clk),
@@ -214,7 +215,7 @@ module top (
         .I_sdrc_addr(sdrc_addr),
         .I_sdrc_dqm(sdrc_dqm),
         .I_sdrc_data(sdrc_data_w),
-        .I_sdrc_data_len(8'd0),
+        .I_sdrc_data_len(sdrc_data_len),
         .O_sdrc_data(sdrc_data_r), 
         .O_sdrc_init_done(sdrc_init_done),
         .O_sdrc_cmd_ack(sdrc_cmd_ack)
@@ -260,6 +261,7 @@ module top (
 
     logic sdram_start;
     logic sdram_write;
+    logic [1:0] sdram_length;
     logic [20:0] sdram_address;
     logic [31:0] sdram_data;
     logic [3:0] sdram_dqm;
@@ -420,6 +422,7 @@ module top (
 
         .start(sdram_start),
         .write(sdram_write),
+        .length(sdram_length),
         .address(sdram_address),
         .data(sdram_data),
         .dqm(sdram_dqm),
@@ -432,6 +435,7 @@ module top (
         .sdrc_addr(sdrc_addr),
         .sdrc_data_w(sdrc_data_w),
         .sdrc_dqm(sdrc_dqm),
+        .sdrc_data_len(sdrc_data_len),
         .sdrc_data_r(sdrc_data_r),
         .sdrc_init_done(sdrc_init_done),
         .sdrc_cmd_ack(sdrc_cmd_ack)
@@ -468,6 +472,7 @@ module top (
 
         .sdram_start(sdram_start),
         .sdram_write(sdram_write),
+        .sdram_length(sdram_length),
         .sdram_address(sdram_address),
         .sdram_data(sdram_data),
         .sdram_dqm(sdram_dqm),
