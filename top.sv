@@ -21,10 +21,6 @@ module top (
     input logic uart_rx,
     output logic uart_tx,
 
-    input logic esp_rx,
-    output logic esp_tx,
-    output logic esp_enable,
-    output logic esp_reset_n,
     output logic sd_clk,
     output logic sd_mosi,
     input logic sd_miso,
@@ -119,10 +115,6 @@ module top (
         .uart_rx(uart_rx),
         .uart_tx(uart_tx),
 
-        .esp_rx(esp_rx),
-        .esp_tx(esp_tx),
-        .esp_enable(esp_enable),
-        .esp_reset_n(esp_reset_n),
         .sd_clk(sd_clk),
         .sd_mosi(sd_mosi),
         .sd_miso(sd_miso),

@@ -14,16 +14,45 @@
  * limitations under the License.
  */
 
-#[include "std/io", "std/str", "std/vec", "std/file", "std/thrd",
-    "src/Common/File.zir", "src/Common/Endian.zir", "src/Common/Instruction.zir", "src/Emulator/ESP.zir", "src/Emulator/SD.zir" : *]
+#[include "std/io", "std/str", "std/vec", "std/file", "std/thrd", "std/time",
+    "src/Common/File.zir", "src/Common/Endian.zir", "src/Common/Instruction.zir", "src/Emulator/SD.zir" : *]
+
+class ConsoleInputRecord {
+    pub event_type: u16 = 0,
+    pub padding: u16 = 0,
+    pub key_down: i32 = 0,
+    pub repeat_count: u16 = 0,
+    pub virtual_key: u16 = 0,
+    pub scan_code: u16 = 0,
+    pub character: u16 = 0,
+    pub control_state: u32 = 0;
+
+    ConsoleInputRecord(&mut this) {}
+}
 
 extern "C" {
-    fn _getwch() -> u16;
-    fn _kbhit() -> i32;
     fn SetConsoleOutputCP(page: u32) -> i32;
+    fn GetConsoleMode(hConsoleHandle: *mut void, lpMode: *mut u32) -> i32;
+    fn SetConsoleMode(hConsoleHandle: *mut void, dwMode: u32) -> i32;
+    fn ReadConsoleInputW(hConsoleInput: *mut void, lpBuffer: *mut ConsoleInputRecord, nLength: u32, lpNumberOfEventsRead: *mut u32) -> i32;
 }
 
 const UTF8_CODE_PAGE: u32 = 65001;
+const KEY_EVENT: u16 = 1;
+const ENABLE_PROCESSED_INPUT: u32 = 1;
+
+fn KeySequence(virtual_key: u32) -> *i8 {
+    match virtual_key {
+        0x26 => "\x1B[A",
+        0x28 => "\x1B[B",
+        0x27 => "\x1B[C",
+        0x25 => "\x1B[D",
+        0x24 => "\x1B[H",
+        0x23 => "\x1B[F",
+        0x2E => "\x1B[3~",
+        _ => null
+    }
+}
 
 const CLK_FREQ: u32 = 54000000;
 const CYCLES_PER_MS: u32 = CLK_FREQ / 1000;
@@ -65,7 +94,6 @@ class Emulator {
     tlb_keys: *mut u32,
     tlb_entries: *mut u32,
     timer_compare: u32,
-    esp: ESP01,
     output_pending: String,
     output_needed: u32,
     pub sd: SDCard;
@@ -156,7 +184,6 @@ class Emulator {
         (this.page_table_base, this.address_space) = (0, 0);
         this.FlushTLB();
         this.timer_compare = 0;
-        this.esp.Reset();
         this.sd.Reset();
 
         for i in 0..32 {
@@ -176,7 +203,7 @@ class Emulator {
 
     fn IsDevice(&this, address: u32) -> bool {
         address == 0xFFFF || address == 0xFFFC || address == 0xFFF4 || address == 0xFFEC || address == 0xFFE8 || address == 0xFFE4 || address == 0xFFDC ||
-            address == 0xFFC8 || address == 0xFFC4 || address == 0xFFC0 || address == 0xFFBC || address == 0xFFB8 || address == 0xFFB4 || address == 0xFFB0
+            address == 0xFFB8 || address == 0xFFB4 || address == 0xFFB0
     }
 
     fn IsUARTReady(&mut this) -> bool {
@@ -189,8 +216,7 @@ class Emulator {
     fn GetPendingInterrupts(&mut this, mask: u32) -> u32 {
         let uart: u32 = if (mask & 2) != 0 && this.IsUARTReady() { 2 } else { 0 };
         let timer: u32 = if (mask & 1) != 0 && ((this.cycle_counter as u32 - this.timer_compare) as i32) >= 0 { 1 } else { 0 };
-        let esp: u32 = if (mask & 4) != 0 && this.esp.HasByte(this.cycle_counter) { 4 } else { 0 };
-        esp | uart | timer
+        uart | timer
     }
 
     fn ReadCSR(&mut this, index: u32) -> u32 {
@@ -203,7 +229,7 @@ class Emulator {
         } else if index == CSR::IENABLE as u32 {
             this.interrupt_mask
         } else if index == CSR::IPENDING as u32 {
-            this.GetPendingInterrupts(7)
+            this.GetPendingInterrupts(3)
         } else if index == CSR::EPC as u32 {
             this.trap_pc
         } else if index == CSR::CAUSE as u32 {
@@ -365,10 +391,6 @@ class Emulator {
             0xFFE8 => this.cycle_counter as u32,
             0xFFE4 => this.instruction_counter,
             0xFFDC => this.timer_compare,
-            0xFFC8 => this.esp.ReadByte(this.cycle_counter),
-            0xFFC4 => this.esp.Status(this.cycle_counter),
-            0xFFC0 => this.esp.divisor,
-            0xFFBC => this.esp.control,
             0xFFB8 => this.sd.Received() as u32,
             0xFFB4 => this.sd.PortStatus(),
             0xFFB0 => this.sd.divisor,
@@ -415,10 +437,6 @@ class Emulator {
     fn WriteByte(&mut this, address: u32, value: u8) {
         if address == 0xFFFF {
             this.WriteOutput(value);
-        } else if address == 0xFFC8 {
-            this.esp.WriteByte(value, this.cycle_counter);
-        } else if address == 0xFFBC {
-            this.esp.SetControl(value as u32, this.cycle_counter);
         } else if address == 0xFFB8 {
             this.sd.Transfer(value);
         } else if address == 0xFFB4 {
@@ -456,9 +474,6 @@ class Emulator {
             0xFFDC => {
                 this.timer_compare = value;
             },
-            0xFFC0 => {
-                this.esp.divisor = value & 0xFFFF;
-            },
             _ => {
                 this.WriteByte(address, (value & 0xFF) as u8);
                 this.WriteByte(address + 1, ((value >> 8) & 0xFF) as u8);
@@ -471,21 +486,9 @@ class Emulator {
     fn WaitForInterrupt(&mut this) {
         let timer_enabled = (this.interrupt_mask & 1) != 0;
         let uart_enabled = (this.interrupt_mask & 2) != 0;
-        let esp_enabled = (this.interrupt_mask & 4) != 0;
-        if !timer_enabled && !uart_enabled && !esp_enabled { return; }
-        if esp_enabled && this.esp.HasByte(this.cycle_counter) { return; }
-        let mut has_deadline = timer_enabled;
-        let mut cycles_until_deadline: i64 = if timer_enabled { (this.timer_compare - this.cycle_counter as u32) as i32 as i64 } else { 0 };
-
-        if esp_enabled && this.esp.NextTime() > this.cycle_counter {
-            let cycles_until_esp = (this.esp.NextTime() - this.cycle_counter) as i64;
-
-            if !has_deadline || cycles_until_esp < cycles_until_deadline {
-                cycles_until_deadline = cycles_until_esp;
-            }
-
-            has_deadline = true;
-        }
+        if !timer_enabled && !uart_enabled { return; }
+        let has_deadline = timer_enabled;
+        let cycles_until_deadline: i64 = if timer_enabled { (this.timer_compare - this.cycle_counter as u32) as i32 as i64 } else { 0 };
 
         let mut elapsed_cycles: u64 = 0;
         this.uart_mutex.Lock();
@@ -515,7 +518,7 @@ class Emulator {
         } else { 0 };
 
         if interrupts != 0 {
-            this.Trap(if (interrupts & 1) != 0 { TrapCause::Timer as u32 } else if (interrupts & 2) != 0 { TrapCause::UART as u32 } else { TrapCause::ESP as u32 }, this.pc, 0);
+            this.Trap(if (interrupts & 1) != 0 { TrapCause::Timer as u32 } else { TrapCause::UART as u32 }, this.pc, 0);
         }
 
         let mut fetch_address: u32 = 0;
@@ -835,26 +838,62 @@ class Emulator {
         }
     }
 
-    fn UARTThread(&mut this) {
-        loop {
-            let character = _getwch() as u32;
+    fn ReceiveKey(&mut this, record: &ConsoleInputRecord, high_surrogate: &mut u32) {
+        let sequence = KeySequence(record.virtual_key as u32);
 
-            if character == 0 || (character == 0xE0 && _kbhit() != 0) {
-                match _getwch() as u32 {
-                    0x48 => this.Receive("\x1B[A"),
-                    0x50 => this.Receive("\x1B[B"),
-                    0x4D => this.Receive("\x1B[C"),
-                    0x4B => this.Receive("\x1B[D"),
-                    0x47 => this.Receive("\x1B[H"),
-                    0x4F => this.Receive("\x1B[F"),
-                    0x53 => this.Receive("\x1B[3~"),
-                    _ => ()
-                }
-            } else if character >= 0xD800 && character < 0xDC00 {
-                let low = _getwch() as u32;
-                this.ReceiveCode(0x10000 + ((character - 0xD800) << 10) + (low & 0x3FF));
-            } else {
-                this.ReceiveCode(character);
+        if sequence != null {
+            this.Receive(sequence);
+            return;
+        }
+
+        let character = record.character as u32;
+
+        if character >= 0xD800 && character < 0xDC00 {
+            high_surrogate = character;
+        } else if character >= 0xDC00 && character < 0xE000 {
+            if high_surrogate != 0 {
+                this.ReceiveCode(0x10000 + ((high_surrogate - 0xD800) << 10) + (character & 0x3FF));
+            }
+
+            high_surrogate = 0;
+        } else if character != 0 {
+            high_surrogate = 0;
+            this.ReceiveCode(character);
+        }
+    }
+
+    fn UARTThread(&mut this) {
+        let input = CreateFileA("CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, null, OPEN_EXISTING, 0, null);
+        let mut high_surrogate: u32 = 0;
+
+        loop {
+            let mut mode: u32 = 0;
+            let has_mode = GetConsoleMode(input, &mut mode) != 0;
+
+            if has_mode {
+                SetConsoleMode(input, mode & !ENABLE_PROCESSED_INPUT);
+            }
+
+            let mut record = ConsoleInputRecord();
+            let mut count: u32 = 0;
+            let read = ReadConsoleInputW(input, &mut record, 1, &mut count) != 0;
+
+            if has_mode {
+                SetConsoleMode(input, mode);
+            }
+
+            if !read {
+                return;
+            }
+
+            if count == 0 || record.event_type != KEY_EVENT || record.key_down == 0 {
+                continue;
+            }
+
+            let repeats = if record.repeat_count == 0 { 1 } else { record.repeat_count as u32 };
+
+            for _ in 0..repeats {
+                this.ReceiveKey(record, high_surrogate);
             }
         }
     }
