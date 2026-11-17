@@ -32,6 +32,8 @@ module dcache #(
     output logic clearing,
 
     input logic flush,
+    input logic invalidate,
+    input logic [20:0] snoop_address,
     input logic store,
     input logic [20:0] store_address,
     input logic [31:0] store_data,
@@ -54,6 +56,8 @@ module dcache #(
 
     logic [31:0] data [0:LINES * LINE_WORDS - 1];
     logic [TAG_BITS:0] tags [0:LINES - 1];
+    logic [TAG_BITS:0] snoop_tags [0:LINES - 1];
+    logic [TAG_BITS:0] snoop_entry;
     logic read_valid;
     logic [TAG_BITS - 1:0] read_tag;
 
@@ -68,6 +72,7 @@ module dcache #(
     wire miss = lookup && !(read_valid && read_tag == lookup_tag);
     wire fill_write = grant && issued && sdram_valid;
     wire store_hit = store && read_valid && read_tag == store_address[20 -: TAG_BITS];
+    wire snoop_hit = invalidate && snoop_entry[TAG_BITS] && snoop_entry[TAG_BITS - 1:0] == store_address[20 -: TAG_BITS];
     logic [31:0] store_word;
 
     always_comb begin
@@ -87,13 +92,20 @@ module dcache #(
         else if (store_hit)
             data[store_address[OFFSET_BITS + INDEX_BITS - 1:0]] <= store_word;
 
-        if (clearing)
+        if (clearing) begin
             tags[clear_index] <= '0;
-        else if (fill_done)
+            snoop_tags[clear_index] <= '0;
+        end else if (snoop_hit) begin
+            tags[store_address[OFFSET_BITS +: INDEX_BITS]] <= '0;
+            snoop_tags[store_address[OFFSET_BITS +: INDEX_BITS]] <= '0;
+        end else if (fill_done) begin
             tags[lookup_index] <= {1'b1, lookup_tag};
+            snoop_tags[lookup_index] <= {1'b1, lookup_tag};
+        end
 
         read_data <= data[{index, offset}];
         {read_valid, read_tag} <= tags[index];
+        snoop_entry <= snoop_tags[snoop_address[OFFSET_BITS +: INDEX_BITS]];
     end
 
     always_ff @(posedge clk or posedge rst) begin

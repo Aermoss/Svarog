@@ -300,6 +300,15 @@ class Parser {
             let (operand, kind) = (operands[i], signature[i]);
             let number = String::FromInteger(i as HostUnsigned + 1);
 
+            if kind == 'A' {
+                if !this.IsRegister(operand->expression) {
+                    Logger::Log("Instruction '" + name + "' expects an address register '(reg)' for operand " + number + ".", operand->span, LogSeverity::Error);
+                    valid = false;
+                }
+
+                continue;
+            }
+
             if kind == 'M' {
                 if operand->offset == null {
                     Logger::Log("Instruction '" + name + "' requires dereference operator 'offset(reg)' for operand " + number + ".", operand->span, LogSeverity::Error);

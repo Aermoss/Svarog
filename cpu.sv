@@ -16,28 +16,19 @@
 
 module cpu #(
     parameter bit SIMULATION = 1'b1,
-    parameter int CLK_FREQ = 54000000
+    parameter int CORE_ID = 0
 ) (
     input logic clk,
     input logic rst,
+    input logic [31:0] reset_vector,
 
-    input logic uart_rx,
-    output logic uart_tx,
-
-    output logic sd_clk,
-    output logic sd_mosi,
-    input logic sd_miso,
-    output logic sd_cs_n,
-
-    input logic button,
-    output logic [5:0] leds,
-    output logic ws2812,
-
-    output logic video_write,
-    output logic [11:0] video_address,
-    output logic [15:0] video_data,
-    output logic [15:0] video_cursor,
-    output logic [4:0] video_scroll,
+    input logic [31:0] io_read_word,
+    input logic io_read_hit,
+    output logic [3:0] io_write_enable,
+    output logic [31:0] instret,
+    input logic [2:0] interrupt_lines,
+    input logic [31:0] cycle_counter,
+    input logic [31:0] ms_counter,
 
     output logic [31:0] fetch_addr,
     output logic [31:0] fetch_next,
@@ -47,6 +38,12 @@ module cpu #(
     input logic fetch_fault,
 
     output logic mem_access,
+    output logic mem_atomic,
+    output logic [3:0] mem_atomic_op,
+    output logic mem_write_access,
+    output logic mem_fence,
+    output logic reservation_clear,
+    output logic icache_flush,
     output logic [3:0] actual_mem_we,
     output logic [31:0] mem_addr,
     output logic [31:0] ex_addr,
@@ -60,6 +57,7 @@ module cpu #(
     output logic tlb_flush,
     output logic cache_flush,
 
+    input logic fetch_wait,
     input logic bus_stall
 );
     logic [3:0] mem_we;
@@ -129,6 +127,10 @@ module cpu #(
         OP_EBREAK,
         OP_ERET,
         OP_WFI,
+        OP_LR,
+        OP_SC,
+        OP_AMO,
+        OP_FENCE,
         OP_HLT = 6'h3F
     } opcode_t;
 
@@ -146,6 +148,7 @@ module cpu #(
     localparam logic [15:0] CSR_CYCLE = 16;
     localparam logic [15:0] CSR_INSTRET = 17;
     localparam logic [15:0] CSR_TIME = 18;
+    localparam logic [15:0] CSR_COREID = 19;
 
     logic reg_we;
     logic [4:0] reg_addr;
@@ -252,7 +255,7 @@ module cpu #(
         id_static_result = id_next_pc;
 
         case (id_opcode)
-            OP_LB, OP_LBU, OP_LH, OP_LHU, OP_LW: id_load = 1;
+            OP_LB, OP_LBU, OP_LH, OP_LHU, OP_LW, OP_LR, OP_SC, OP_AMO: id_load = 1;
 
             OP_ADDI: begin
                 id_alu_use_imm = 1;
@@ -375,6 +378,7 @@ module cpu #(
 
     logic should_halt;
     logic halted;
+    logic started;
 
     logic should_wait;
     logic waiting_for_interrupt;
@@ -388,6 +392,7 @@ module cpu #(
     logic [4:0] mem_reg_addr;
     logic [31:0] mem_reg0;
     logic mem_load;
+    logic mem_atomic_write;
 
     logic [31:0] wb_pc;
     logic [31:0] wb_instr;
@@ -431,9 +436,16 @@ module cpu #(
         end
     end
 
+    function automatic logic is_atomic_op(opcode_t opcode);
+        case (opcode)
+            OP_LR, OP_SC, OP_AMO: return 1;
+            default: return 0;
+        endcase
+    endfunction
+
     function automatic logic is_load_op(opcode_t opcode);
         case (opcode)
-            OP_LB, OP_LBU, OP_LH, OP_LHU, OP_LW: return 1;
+            OP_LB, OP_LBU, OP_LH, OP_LHU, OP_LW, OP_LR, OP_SC, OP_AMO: return 1;
             default: return 0;
         endcase
     endfunction
@@ -454,7 +466,7 @@ module cpu #(
             OP_B,
             OP_CSRRWI, OP_CSRRSI, OP_CSRRCI,
             OP_ECALL, OP_EBREAK, OP_ERET,
-            OP_WFI, OP_HLT: return 0;
+            OP_WFI, OP_FENCE, OP_HLT: return 0;
             default: return 1;
         endcase
     endfunction
@@ -466,7 +478,8 @@ module cpu #(
             OP_DIV, OP_DIVU, OP_REM, OP_REMU,
             OP_AND, OP_OR, OP_XOR,
             OP_SLL, OP_SRL, OP_SRA,
-            OP_SLT, OP_SLTU: return 1;
+            OP_SLT, OP_SLTU,
+            OP_SC, OP_AMO: return 1;
             default: return 0;
         endcase
     endfunction
@@ -530,173 +543,19 @@ module cpu #(
     assign alu_right = ex_alu_use_imm ? ex_alu_imm : ex_reg2_fwd;
     assign alu_op = ex_alu_op;
 
-    logic [3:0] io_we;
-    logic io_read;
-
-    assign io_we = bus_stall ? 4'b0000 : mem_we;
-    assign io_read = mem_access && mem_we == 0 && !bus_stall;
-
-    logic [3:0] uart_we;
-    logic [15:0] uart_clks_per_bit;
-    logic [7:0] uart_tx_data;
-    logic [7:0] uart_rx_byte;
-    logic uart_rx_ready;
-    logic uart_tx_busy;
-
-    always_comb begin
-        if (uart_we[3]) uart_tx_data = mem_write[31:24];
-        else if (uart_we[2]) uart_tx_data = mem_write[23:16];
-        else if (uart_we[1]) uart_tx_data = mem_write[15:8];
-        else uart_tx_data = mem_write[7:0];
-    end
-
-    uart #(
-        .CLK_FREQ(CLK_FREQ),
-        .ECHO(SIMULATION)
-    ) console_uart0 (
-        .clk(clk),
-        .rst(rst),
-        .write(mem_addr == 32'hFFFF && io_we != 0),
-        .write_data(uart_tx_data),
-        .read(mem_addr == 32'hFFFF && io_read),
-        .read_data(uart_rx_byte),
-        .rx_ready(uart_rx_ready),
-        .tx_busy(uart_tx_busy),
-        .divisor_write(mem_addr == 32'hFFF8 && io_we != 0),
-        .divisor_data(mem_write[15:0]),
-        .divisor(uart_clks_per_bit),
-        .rx_pin(uart_rx),
-        .tx_pin(uart_tx)
-    );
-
-    logic [31:0] ms_counter;
-    logic [21:0] tick_divider;
-
-    localparam int TICK_MAX = (CLK_FREQ / 1000) - 1;
-
-    always_ff @(posedge clk or posedge rst) begin
-        if (rst) begin
-            ms_counter <= 0;
-            tick_divider <= 0;
-        end else if (tick_divider >= TICK_MAX) begin
-            tick_divider <= 0;
-            ms_counter <= ms_counter + 32'd1;
-        end else begin
-            tick_divider <= tick_divider + 31'd1;
-        end
-    end
-
-    logic [31:0] cycle_counter;
     logic [31:0] instret_counter;
 
-    always_ff @(posedge clk or posedge rst) begin
-        if (rst) begin
-            cycle_counter <= 0;
-            instret_counter <= 0;
-        end else begin
-            cycle_counter <= cycle_counter + 32'd1;
-
-            if (!bus_stall && wb_instr != 0)
-                instret_counter <= instret_counter + 32'd1;
-        end
-    end
-
-    logic [31:0] timer_compare;
-    logic timer_pending;
-
-    always_ff @(posedge clk or posedge rst) begin
-        if (rst) begin
-            timer_compare <= 0;
-            timer_pending <= 0;
-        end else begin
-            if (mem_addr == 32'hFFDC && io_we != 0)
-                timer_compare <= mem_write;
-
-            timer_pending <= $signed(cycle_counter - timer_compare) >= 0;
-        end
-    end
-
-    logic button_sync0, button_sync1;
-
-    always_ff @(posedge clk or posedge rst) begin
-        if (rst) begin
-            button_sync0 <= 1'b0;
-            button_sync1 <= 1'b0;
-        end else begin
-            button_sync0 <= button;
-            button_sync1 <= button_sync0;
-        end
-    end
+    assign instret = instret_counter;
+    assign io_write_enable = mem_we;
 
     always_ff @(posedge clk or posedge rst) begin
         if (rst)
-            leds <= 6'h3F;
-        else if (mem_addr == 32'hFFF0 && io_we != 0)
-            leds <= mem_write[5:0];
+            instret_counter <= 0;
+        else if (!bus_stall && wb_instr != 0)
+            instret_counter <= instret_counter + 32'd1;
     end
 
-    logic in_text_window;
-
-    assign in_text_window = mem_addr[31:14] == 18'd2;
-    assign video_write = in_text_window && io_we != 0;
-    assign video_address = mem_addr[13:2];
-    assign video_data = mem_write[15:0];
-
-    always_ff @(posedge clk or posedge rst) begin
-        if (rst) begin
-            video_cursor <= 0;
-            video_scroll <= 0;
-        end else if (mem_addr == 32'hFFD0 && io_we != 0) begin
-            video_cursor <= mem_write[15:0];
-        end else if (mem_addr == 32'hFFCC && io_we != 0) begin
-            video_scroll <= mem_write[4:0];
-        end
-    end
-
-    ws2812 #(
-        .CLK_FREQ(CLK_FREQ)
-    ) ws2812_0 (
-        .clk(clk),
-        .rst(rst),
-        .strobe(mem_addr == 32'hFFE0 && io_we != 0),
-        .write(mem_write[23:0]),
-        .busy(),
-        .out(ws2812)
-    );
-
-    logic [7:0] spi_read_data;
-    logic [4:0] spi_status;
-    logic [7:0] spi_divisor;
-
-    spi sd_spi0 (
-        .clk(clk),
-        .rst(rst),
-        .data_write(mem_addr == 32'hFFB8 && io_we != 0),
-        .write_data(mem_write[7:0]),
-        .read_data(spi_read_data),
-        .control_write(mem_addr == 32'hFFB4 && io_we != 0),
-        .control_data(mem_write[4:0]),
-        .status(spi_status),
-        .divisor_write(mem_addr == 32'hFFB0 && io_we != 0),
-        .divisor_data(mem_write[7:0]),
-        .divisor(spi_divisor),
-        .sclk(sd_clk),
-        .mosi(sd_mosi),
-        .miso(sd_miso),
-        .cs_n(sd_cs_n)
-    );
-
-    always_comb begin
-        uart_we = 0;
-        actual_mem_we = 0;
-
-        if (mem_addr == 32'hFFFF)
-            uart_we = io_we;
-        else if (mem_addr != 32'hFFF0 && mem_addr != 32'hFFE0 && mem_addr != 32'hFFEC && mem_addr != 32'hFFF4 && mem_addr != 32'hFFF8 && mem_addr != 32'hFFE8 && mem_addr != 32'hFFE4 && mem_addr != 32'hFFDC && mem_addr != 32'hFFD0 && mem_addr != 32'hFFCC &&
-                mem_addr != 32'hFFB8 && mem_addr != 32'hFFB4 &&
-                mem_addr != 32'hFFB0 && !in_text_window)
-            actual_mem_we = mem_we;
-    end
+    assign actual_mem_we = (stage_mem_addr[31:8] == 24'h0000FF || stage_mem_addr[31:14] == 18'd2) ? 4'b0000 : mem_we;
 
     logic csr_ie;
     logic csr_pie;
@@ -720,15 +579,15 @@ module cpu #(
     logic ex_privileged;
     logic take_exception;
 
-    assign csr_ipending = {30'b0, uart_rx_ready, timer_pending};
+    assign csr_ipending = {29'b0, interrupt_lines};
     assign interrupts = csr_ipending & csr_ienable;
     assign take_interrupt = csr_ie && interrupts != 0 && !halted && !take_data_fault && (waiting_for_interrupt || (ex_instr != 0 && !is_multicycle_op));
 
     always_comb begin
-        ex_defined = (6'(ex_opcode) <= 6'(OP_WFI)) || (ex_opcode == OP_HLT);
+        ex_defined = (6'(ex_opcode) <= 6'(OP_FENCE)) || (ex_opcode == OP_HLT);
         ex_csr = (6'(ex_opcode) >= 6'(OP_CSRRW)) && (6'(ex_opcode) <= 6'(OP_CSRRCI));
         ex_csr_writes = ex_csr && (ex_opcode == OP_CSRRW || ex_opcode == OP_CSRRWI || ex_instr[20:16] != 0);
-        ex_csr_read_only = (ex_imm16 >= CSR_CYCLE) && (ex_imm16 <= CSR_TIME);
+        ex_csr_read_only = (ex_imm16 >= CSR_CYCLE) && (ex_imm16 <= CSR_COREID);
 
         case (ex_opcode)
             OP_ERET, OP_WFI, OP_HLT: ex_privileged = 1;
@@ -747,7 +606,7 @@ module cpu #(
 
     assign take_exception = !take_interrupt && !take_data_fault && !halted &&
         (ex_fetch_fault || ex_opcode == OP_EBREAK || !ex_defined || (ex_csr_writes && ex_csr_read_only) || (user_mode && ex_privileged));
-    assign should_wait = ex_opcode == OP_WFI && !take_exception && !take_data_fault && csr_ienable[1:0] != 0 && interrupts == 0;
+    assign should_wait = ex_opcode == OP_WFI && !take_exception && !take_data_fault && csr_ienable[2:0] != 0 && interrupts == 0;
     assign wake_from_interrupt = waiting_for_interrupt && interrupts != 0;
 
     always_comb begin
@@ -765,6 +624,7 @@ module cpu #(
             CSR_CYCLE: csr_read = cycle_counter;
             CSR_INSTRET: csr_read = instret_counter;
             CSR_TIME: csr_read = ms_counter;
+            CSR_COREID: csr_read = CORE_ID;
             default: csr_read = 0;
         endcase
     end
@@ -786,7 +646,7 @@ module cpu #(
         end else if (!bus_stall) begin
             if (take_data_fault) begin
                 csr_epc <= mem_pc;
-                csr_cause <= mem_we_raw != 0 ? 32'h00000007 : 32'h00000005;
+                csr_cause <= (mem_we_raw != 0 || mem_atomic_write) ? 32'h00000007 : 32'h00000005;
                 csr_badaddr <= stage_mem_addr;
                 csr_pie <= csr_ie;
                 csr_ie <= 0;
@@ -794,7 +654,7 @@ module cpu #(
                 user_mode <= 0;
             end else if (take_interrupt) begin
                 csr_epc <= waiting_for_interrupt ? if_pc : ex_pc;
-                csr_cause <= interrupts[0] ? 32'h80000000 : 32'h80000001;
+                csr_cause <= interrupts[0] ? 32'h80000000 : (interrupts[1] ? 32'h80000001 : 32'h80000002);
                 csr_pie <= csr_ie;
                 csr_ie <= 0;
                 csr_pu <= user_mode;
@@ -845,8 +705,11 @@ module cpu #(
         if (rst) begin
             tlb_flush <= 0;
             cache_flush <= 0;
+            icache_flush <= 0;
         end else begin
             tlb_flush <= !bus_stall && ex_csr_writes && ex_imm16 == CSR_TLBFLUSH &&
+                !take_interrupt && !take_exception && !take_data_fault;
+            icache_flush <= !bus_stall && ex_opcode == OP_FENCE && ex_instr[0] &&
                 !take_interrupt && !take_exception && !take_data_fault;
             cache_flush <= csr_write[0];
         end
@@ -874,7 +737,7 @@ module cpu #(
         .clk(clk),
         .rst(rst),
         .fetch_pc(if_pc),
-        .fetch_advance(!bus_stall && !should_take_branch && !halted && !hazard_stall && !alu_stall && !waiting_for_interrupt),
+        .fetch_advance(!bus_stall && !should_take_branch && !halted && !hazard_stall && !alu_stall && !waiting_for_interrupt && !fetch_wait),
         .predict_taken(predict_taken),
         .predict_target(predict_target),
         .predict_hit(predict_hit),
@@ -905,6 +768,9 @@ module cpu #(
             OP_LB, OP_LBU, OP_LH, OP_LHU, OP_LW, OP_SB, OP_SH, OP_SW:
                 ex_addr = ex_reg1_fwd + ex_simm16;
 
+            OP_LR, OP_SC, OP_AMO:
+                ex_addr = ex_reg1_fwd;
+
             OP_ECALL: branch_target = csr_vector;
             OP_ERET: branch_target = csr_epc;
             OP_HLT: should_halt = 1;
@@ -917,7 +783,7 @@ module cpu #(
     end
 
     assign mem_addr = stage_mem_addr;
-    assign fetch_repeat = hazard_stall || alu_stall || waiting_for_interrupt;
+    assign fetch_repeat = hazard_stall || alu_stall || waiting_for_interrupt || fetch_wait;
     assign fetch_next = if_pc;
     assign fetch_current = if_pc_current;
     assign fetch_addr = fetch_repeat ? if_pc_current : if_pc;
@@ -948,39 +814,20 @@ module cpu #(
                 mem_write = mem_reg0;
                 mem_access_raw = 1;
             end
-        endcase
-    end
 
-    assign take_data_fault = mem_access_raw && ((user_mode && stage_mem_addr[31:30] != 2'b11) || data_fault);
-    assign mem_access = mem_access_raw && !take_data_fault;
-    assign mem_we = take_data_fault ? 4'b0000 : mem_we_raw;
-
-    logic [31:0] io_read_word;
-    logic io_read_hit;
-
-    always_comb begin
-        io_read_hit = 1;
-
-        case (stage_mem_addr)
-            32'hFFFF: io_read_word = {4{uart_rx_byte}};
-            32'hFFFC: io_read_word = {30'b0, uart_tx_busy, uart_rx_ready};
-            32'hFFF8: io_read_word = {16'b0, uart_clks_per_bit};
-            32'hFFEC: io_read_word = ms_counter;
-            32'hFFF4: io_read_word = {31'b0, button_sync1};
-            32'hFFE8: io_read_word = cycle_counter;
-            32'hFFE4: io_read_word = instret_counter;
-            32'hFFDC: io_read_word = timer_compare;
-            32'hFFD0: io_read_word = {16'b0, video_cursor};
-            32'hFFCC: io_read_word = {27'b0, video_scroll};
-            32'hFFB8: io_read_word = {24'b0, spi_read_data};
-            32'hFFB4: io_read_word = {27'b0, spi_status};
-            32'hFFB0: io_read_word = {24'b0, spi_divisor};
-            default: begin
-                io_read_word = 0;
-                io_read_hit = stage_mem_addr[31:14] == 18'd2;
+            OP_LR, OP_SC, OP_AMO: begin
+                mem_write = mem_reg0;
+                mem_access_raw = 1;
             end
         endcase
     end
+
+    assign mem_write_access = mem_we != 4'b0000 || (mem_access && mem_atomic_write);
+
+    assign take_data_fault = mem_access_raw && ((user_mode && stage_mem_addr[31:30] != 2'b11) || data_fault);
+    assign reservation_clear = !bus_stall && (take_data_fault || take_interrupt || take_exception || ex_opcode == OP_ECALL || ex_opcode == OP_ERET);
+    assign mem_access = mem_access_raw && !take_data_fault;
+    assign mem_we = take_data_fault ? 4'b0000 : mem_we_raw;
 
     logic wb_writes;
     logic wb_load;
@@ -1077,6 +924,7 @@ module cpu #(
             halted <= 0;
             waiting_for_interrupt <= 0;
             branch_taken <= 1;
+            started <= CORE_ID == 0;
 
             mem_pc <= 0;
             mem_instr <= 0;
@@ -1086,6 +934,10 @@ module cpu #(
             mem_reg_addr <= 0;
             mem_reg0 <= 0;
             mem_load <= 0;
+            mem_atomic <= 0;
+            mem_atomic_op <= 0;
+            mem_atomic_write <= 0;
+            mem_fence <= 0;
 
             wb_pc <= 0;
             wb_instr <= 0;
@@ -1104,7 +956,11 @@ module cpu #(
             if (reg_we && reg_addr != 0)
                 regs[reg_addr] <= reg_write;
 
-            if (should_take_branch) begin
+            if (!started) begin
+                if_pc <= reset_vector;
+                if_pc_current <= reset_vector;
+                if_pred_taken <= 0;
+            end else if (should_take_branch) begin
                 if_pc <= branch_target;
                 if_pc_current <= branch_target;
                 if_pred_taken <= 0;
@@ -1112,7 +968,7 @@ module cpu #(
                 if_pc <= 0;
                 if_pc_current <= 0;
                 if_pred_taken <= 0;
-            end else if (hazard_stall || alu_stall || waiting_for_interrupt) begin
+            end else if (hazard_stall || alu_stall || waiting_for_interrupt || fetch_wait) begin
                 if_pc <= if_pc;
                 if_pc_current <= if_pc_current;
             end else begin
@@ -1132,6 +988,10 @@ module cpu #(
             end
 
             if (should_take_branch || branch_taken || halted || waiting_for_interrupt) begin
+                id_instr <= 0;
+                id_fetch_fault <= 0;
+                id_pred_taken <= 0;
+            end else if (fetch_wait && !hazard_stall && !alu_stall) begin
                 id_instr <= 0;
                 id_fetch_fault <= 0;
                 id_pred_taken <= 0;
@@ -1194,7 +1054,7 @@ module cpu #(
                     ex_branch_if_ne <= id_branch_if_ne;
                     ex_branch_if_lt <= id_branch_if_lt;
                     ex_branch_if_ge <= id_branch_if_ge;
-                    ex_system_branch <= id_opcode == OP_ECALL || id_opcode == OP_ERET;
+                    ex_system_branch <= id_opcode == OP_ECALL || id_opcode == OP_ERET || (id_opcode == OP_FENCE && id_instr[0]);
                     ex_pred_taken <= id_pred_taken;
                     ex_fetch_fault <= id_fetch_fault;
                 end
@@ -1208,7 +1068,8 @@ module cpu #(
             else if (should_wait)
                 waiting_for_interrupt <= 1;
 
-            branch_taken <= should_take_branch;
+            branch_taken <= should_take_branch || !started;
+            started <= 1;
 
             if (alu_stall || take_interrupt || take_exception || take_data_fault) begin
                 mem_pc <= 0;
@@ -1219,6 +1080,10 @@ module cpu #(
                 mem_reg_addr <= 0;
                 mem_reg0 <= 0;
                 mem_load <= 0;
+                mem_atomic <= 0;
+                mem_atomic_op <= 0;
+                mem_atomic_write <= 0;
+                mem_fence <= 0;
             end else begin
                 mem_pc <= ex_pc;
                 mem_instr <= ex_instr;
@@ -1226,8 +1091,12 @@ module cpu #(
                 stage_mem_addr <= ex_addr;
                 mem_opcode <= ex_opcode;
                 mem_reg_addr <= ex_reg_addr;
-                mem_reg0 <= ex_reg0_fwd;
+                mem_reg0 <= is_atomic_op(ex_opcode) ? ex_reg2_fwd : ex_reg0_fwd;
                 mem_load <= ex_load;
+                mem_atomic <= is_atomic_op(ex_opcode);
+                mem_atomic_op <= ex_opcode == OP_LR ? 4'd9 : (ex_opcode == OP_SC ? 4'd10 : ex_instr[6:3]);
+                mem_atomic_write <= ex_opcode == OP_SC || ex_opcode == OP_AMO;
+                mem_fence <= ex_opcode == OP_FENCE;
             end
 
             wb_pc <= mem_pc;
@@ -1244,7 +1113,7 @@ module cpu #(
             wb_io <= io_read_hit;
             wb_io_word <= io_read_word;
 
-            if (halted && id_instr == 0 && ex_instr == 0 && mem_instr == 0 && wb_instr == 0)
+            if (SIMULATION && CORE_ID == 0 && halted && id_instr == 0 && ex_instr == 0 && mem_instr == 0 && wb_instr == 0)
                 $finish;
         end
     end

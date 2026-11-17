@@ -50,6 +50,7 @@ class Disassembler {
             16 => "cycle".ToString(),
             17 => "instret".ToString(),
             18 => "time".ToString(),
+            19 => "coreid".ToString(),
             _ => String::FromInteger(index as HostUnsigned)
         }
     }
@@ -123,6 +124,21 @@ class Disassembler {
             Opcode::EBREAK => "ebreak",
             Opcode::ERET => "eret",
             Opcode::WFI => "wfi",
+            Opcode::LR => "lr.w",
+            Opcode::SC => "sc.w",
+            Opcode::AMO => match (word >> ATOMIC_SHIFT) & ATOMIC_MASK {
+                0 => "amoswap.w",
+                1 => "amoadd.w",
+                2 => "amoxor.w",
+                3 => "amoand.w",
+                4 => "amoor.w",
+                5 => "amomin.w",
+                6 => "amomax.w",
+                7 => "amominu.w",
+                8 => "amomaxu.w",
+                _ => "amo?.w"
+            },
+            Opcode::FENCE => if (word & FENCE_INSTRUCTION) != 0 { "fence.i" } else { "fence" },
             Opcode::HLT => "hlt"
         }.ToString();
 
@@ -164,6 +180,10 @@ class Disassembler {
             }
         } else if opcode >= Opcode::CSRRW && opcode <= Opcode::CSRRC {
             mnemonic + " " + this.DisassembleRegister(reg0) + ", " + this.DisassembleCSR(imm16) + ", " + this.DisassembleRegister(reg1)
+        } else if opcode == Opcode::LR {
+            mnemonic + " " + this.DisassembleRegister(reg0) + ", (" + this.DisassembleRegister(reg1) + ")"
+        } else if opcode == Opcode::SC || opcode == Opcode::AMO {
+            mnemonic + " " + this.DisassembleRegister(reg0) + ", " + this.DisassembleRegister(reg2) + ", (" + this.DisassembleRegister(reg1) + ")"
         } else if opcode >= Opcode::CSRRWI && opcode <= Opcode::CSRRCI {
             mnemonic + " " + this.DisassembleRegister(reg0) + ", " + this.DisassembleCSR(imm16) + ", " + String::FromInteger(reg1 as HostUnsigned)
         } else {

@@ -25,12 +25,13 @@ enum Opcode: u32 {
     SLL, SLLI, SRL, SRLI, SRA, SRAI,
     CSRRW, CSRRS, CSRRC, CSRRWI, CSRRSI, CSRRCI,
     ECALL, EBREAK, ERET, WFI,
+    LR, SC, AMO, FENCE,
     HLT = 0x3F
 }
 
 enum CSR: u32 {
     STATUS, IENABLE, IPENDING, EPC, CAUSE, VECTOR, SCRATCH, BADADDR, PTBASE, ASID, TLBFLUSH,
-    CYCLE = 16, INSTRET, TIME
+    CYCLE = 16, INSTRET, TIME, COREID
 }
 
 enum TrapCause: u32 {
@@ -41,7 +42,8 @@ enum TrapCause: u32 {
     StoreFault = 0x00000007,
     SystemCall = 0x00000008,
     Timer = 0x80000000,
-    UART = 0x80000001
+    UART = 0x80000001,
+    Software = 0x80000002
 }
 
 const STATUS_IE: u32 = 1;
@@ -49,7 +51,7 @@ const STATUS_PIE: u32 = 2;
 const STATUS_PU: u32 = 4;
 
 const FIRST_READ_ONLY_CSR: u32 = 16;
-const LAST_READ_ONLY_CSR: u32 = 18;
+const LAST_READ_ONLY_CSR: u32 = 19;
 const CSR_IMMEDIATE_MASK: u32 = 0x1F;
 
 const WINDOW_START: u32 = 0xC0000000;
@@ -59,6 +61,15 @@ const PTBASE_VALID: u32 = 1;
 const PTE_VALID: u32 = 1;
 const PTE_WRITE: u32 = 2;
 const PTE_EXECUTE: u32 = 4;
+
+enum AtomicOperation: u32 {
+    Swap, Add, Xor, And, Or, Min, Max, MinU, MaxU
+}
+
+const ATOMIC_SHIFT: u32 = 3;
+const ATOMIC_MASK: u32 = 0xF;
+const ATOMIC_ORDERING: u32 = 3;
+const FENCE_INSTRUCTION: u32 = 1;
 
 const OPCODE_SHIFT: u32 = 26;
 const REG0_SHIFT: u32 = 21;

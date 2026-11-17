@@ -27,6 +27,7 @@ fn PrintUsage(executable: String) {
     WriteLine("OVERVIEW: Svarog emulator");
     WriteLine("USAGE: " + executable + " [options] <input>");
     WriteLine("OPTIONS:");
+    WriteLine("  --cores=<count>          Number of cores to emulate (1 to 32, 2 if not given)");
     WriteLine("  --flash=<file>[@<offset>] Load <file> into flash at <offset>, 0x100000 if not given");
     WriteLine("  --quiet                  Do not report writes to the LEDs, WS2812 and baud rate");
     WriteLine("  --sd=<file>              Use <file> as the image of the SD card");
@@ -44,6 +45,7 @@ fn Main(args: &mut Vector<String>) -> i32 {
     }
 
     let mut quiet = false;
+    let mut cores = DEFAULT_CORES;
     let mut input = String();
     let mut flash_files = Vector<String>();
     let mut flash_offsets = Vector<u32>();
@@ -61,6 +63,15 @@ fn Main(args: &mut Vector<String>) -> i32 {
             return 0;
         } else if arg == "--quiet" {
             quiet = true;
+        } else if arg.StartsWith("--cores=") {
+            let count = arg.SubString(8).ToUnsignedInteger();
+
+            if count.IsNone() || count.Unwrap() == 0 || count.Unwrap() > MAX_CORES as HostUnsigned {
+                Logger::Log("Invalid core count '" + arg.SubString(8) + "', it must be between 1 and " + String::FromInteger(MAX_CORES as HostUnsigned) + ".", LogSeverity::Error);
+                return 1;
+            }
+
+            cores = count.Unwrap() as u32;
         } else if arg.StartsWith("--sd=") {
             card = arg.SubString(5);
 
@@ -102,7 +113,7 @@ fn Main(args: &mut Vector<String>) -> i32 {
         return 1;
     }
 
-    let mut emulator = Emulator(quiet);
+    let mut emulator = Emulator(quiet, cores);
 
     if !emulator.Load(input, 0) {
         Logger::Log("Failed to load program '" + input + "'.", LogSeverity::Error);

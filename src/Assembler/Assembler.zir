@@ -106,6 +106,7 @@ class Assembler {
             else if value == "cycle" { 16 }
             else if value == "instret" { 17 }
             else if value == "time" { 18 }
+            else if value == "coreid" { 19 }
             else {
                 this.AssembleExpression(node)
             }
@@ -263,6 +264,9 @@ class Assembler {
             Mnemonic::Ebreak => Opcode::EBREAK,
             Mnemonic::Eret => Opcode::ERET,
             Mnemonic::Wfi => Opcode::WFI,
+            Mnemonic::LrW => Opcode::LR,
+            Mnemonic::ScW => Opcode::SC,
+            Mnemonic::Fence | Mnemonic::FenceI => Opcode::FENCE,
             Mnemonic::Hlt => Opcode::HLT,
             _ => Opcode::NOP
         }
@@ -530,6 +534,41 @@ class Assembler {
         if mnemonic == Mnemonic::Rdcycle || mnemonic == Mnemonic::Rdtime || mnemonic == Mnemonic::Rdinstret {
             let csr = if mnemonic == Mnemonic::Rdcycle { CSR::CYCLE } else if mnemonic == Mnemonic::Rdtime { CSR::TIME } else { CSR::INSTRET };
             this.WriteWord(this.section, this.CSRWord(Opcode::CSRRS, this.AssembleExpression(operands[0]->expression), csr as u32, 0));
+            return;
+        }
+
+        if mnemonic.IsAtomic() {
+            let destination = this.AssembleExpression(operands[0]->expression);
+            let address = if mnemonic == Mnemonic::LrW { operands[1] } else { operands[2] };
+            let source = if mnemonic == Mnemonic::LrW { 0 } else { this.AssembleExpression(operands[1]->expression) };
+            let base = this.AssembleExpression(address->expression);
+
+            if address->offset != null && this.AssembleExpression(address->offset) != 0 {
+                this.Error("Atomic instructions do not take an offset.", address->span);
+            }
+
+            let (atomic_opcode, operation) = match mnemonic {
+                Mnemonic::LrW => (Opcode::LR, AtomicOperation::Swap),
+                Mnemonic::ScW => (Opcode::SC, AtomicOperation::Swap),
+                Mnemonic::AmoswapW => (Opcode::AMO, AtomicOperation::Swap),
+                Mnemonic::AmoaddW => (Opcode::AMO, AtomicOperation::Add),
+                Mnemonic::AmoxorW => (Opcode::AMO, AtomicOperation::Xor),
+                Mnemonic::AmoandW => (Opcode::AMO, AtomicOperation::And),
+                Mnemonic::AmoorW => (Opcode::AMO, AtomicOperation::Or),
+                Mnemonic::AmominW => (Opcode::AMO, AtomicOperation::Min),
+                Mnemonic::AmomaxW => (Opcode::AMO, AtomicOperation::Max),
+                Mnemonic::AmominuW => (Opcode::AMO, AtomicOperation::MinU),
+                Mnemonic::AmomaxuW => (Opcode::AMO, AtomicOperation::MaxU),
+                _ => (Opcode::AMO, AtomicOperation::Swap)
+            };
+
+            this.WriteWord(this.section, (atomic_opcode as u32 << OPCODE_SHIFT) | (destination << REG0_SHIFT) | (base << REG1_SHIFT) |
+                (source << REG2_SHIFT) | (operation as u32 << ATOMIC_SHIFT) | ATOMIC_ORDERING);
+            return;
+        }
+
+        if mnemonic == Mnemonic::Fence || mnemonic == Mnemonic::FenceI {
+            this.WriteWord(this.section, (Opcode::FENCE as u32 << OPCODE_SHIFT) | (if mnemonic == Mnemonic::FenceI { FENCE_INSTRUCTION } else { 0 }));
             return;
         }
 

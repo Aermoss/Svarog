@@ -30,7 +30,9 @@ module store_buffer #(
     output logic full,
     output logic [20:0] head_address,
     output logic [31:0] head_data,
-    output logic [3:0] head_dqm
+    output logic [3:0] head_dqm,
+    output logic [DEPTH - 1:0][18:0] entry_lines,
+    output logic [DEPTH - 1:0] entry_valid
 );
     localparam int POINTER_BITS = $clog2(DEPTH);
 
@@ -46,6 +48,13 @@ module store_buffer #(
     assign head_address = addresses[head];
     assign head_data = data[head];
     assign head_dqm = dqms[head];
+
+    always_comb begin
+        for (int i = 0; i < DEPTH; i++) begin
+            entry_lines[i] = addresses[i][20:2];
+            entry_valid[i] = POINTER_BITS'(i - int'(head)) < count;
+        end
+    end
 
     always_ff @(posedge clk) begin
         if (push) begin

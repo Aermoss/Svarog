@@ -28,7 +28,9 @@ enum Mnemonic: u8 {
     Sll, Slli, Srl, Srli, Sra, Srai,
     Csrrw, Csrrs, Csrrc, Csrrwi, Csrrsi, Csrrci,
     Csrr, Csrw, Csrs, Csrc, Csrwi, Csrsi, Csrci, Rdcycle, Rdtime, Rdinstret,
-    Ecall, Ebreak, Eret, Wfi, Hlt
+    Ecall, Ebreak, Eret, Wfi,
+    LrW, ScW, AmoswapW, AmoaddW, AmoxorW, AmoandW, AmoorW, AmominW, AmomaxW, AmominuW, AmomaxuW, Fence, FenceI,
+    Hlt
 }
 
 extend Mnemonic {
@@ -122,6 +124,19 @@ extend Mnemonic {
             Mnemonic::Ebreak => "ebreak",
             Mnemonic::Eret => "eret",
             Mnemonic::Wfi => "wfi",
+            Mnemonic::LrW => "lr.w",
+            Mnemonic::ScW => "sc.w",
+            Mnemonic::AmoswapW => "amoswap.w",
+            Mnemonic::AmoaddW => "amoadd.w",
+            Mnemonic::AmoxorW => "amoxor.w",
+            Mnemonic::AmoandW => "amoand.w",
+            Mnemonic::AmoorW => "amoor.w",
+            Mnemonic::AmominW => "amomin.w",
+            Mnemonic::AmomaxW => "amomax.w",
+            Mnemonic::AmominuW => "amominu.w",
+            Mnemonic::AmomaxuW => "amomaxu.w",
+            Mnemonic::Fence => "fence",
+            Mnemonic::FenceI => "fence.i",
             Mnemonic::Hlt => "hlt"
         }
     }
@@ -130,13 +145,20 @@ extend Mnemonic {
         this.Name().ToString()
     }
 
+    pub fn IsAtomic(this) -> bool {
+        this as u8 >= Mnemonic::LrW as u8 && this as u8 <= Mnemonic::AmomaxuW as u8
+    }
+
     pub fn Signature(this) -> *i8 {
         match this {
             Mnemonic::Li | Mnemonic::La => "RE",
             Mnemonic::Mv | Mnemonic::Not | Mnemonic::Neg | Mnemonic::Seqz | Mnemonic::Snez | Mnemonic::Sltz | Mnemonic::Sgtz => "RR",
             Mnemonic::Beqz | Mnemonic::Bnez | Mnemonic::Blez | Mnemonic::Bgez | Mnemonic::Bltz | Mnemonic::Bgtz => "RE",
             Mnemonic::Bgt | Mnemonic::Ble | Mnemonic::Bgtu | Mnemonic::Bleu => "RRE",
-            Mnemonic::Nop | Mnemonic::Ecall | Mnemonic::Ebreak | Mnemonic::Eret | Mnemonic::Wfi | Mnemonic::Hlt => "",
+            Mnemonic::Nop | Mnemonic::Ecall | Mnemonic::Ebreak | Mnemonic::Eret | Mnemonic::Wfi | Mnemonic::Fence | Mnemonic::FenceI | Mnemonic::Hlt => "",
+            Mnemonic::LrW => "RA",
+            Mnemonic::ScW | Mnemonic::AmoswapW | Mnemonic::AmoaddW | Mnemonic::AmoxorW | Mnemonic::AmoandW | Mnemonic::AmoorW |
+                Mnemonic::AmominW | Mnemonic::AmomaxW | Mnemonic::AmominuW | Mnemonic::AmomaxuW => "RRA",
             Mnemonic::Lb | Mnemonic::Lbu | Mnemonic::Lh | Mnemonic::Lhu | Mnemonic::Lw | Mnemonic::Sb | Mnemonic::Sh | Mnemonic::Sw => "RM",
             Mnemonic::Lui | Mnemonic::Auipc | Mnemonic::Bl => "RE",
             Mnemonic::B => "E",
@@ -155,7 +177,7 @@ extend Mnemonic {
     }
 }
 
-fn StringToMnemonic(name: &String) -> Option<Mnemonic> {
+fn FindMnemonic(name: &String) -> Option<Mnemonic> {
     let mut mnemonic = Mnemonic::Li;
 
     loop {
@@ -165,6 +187,18 @@ fn StringToMnemonic(name: &String) -> Option<Mnemonic> {
     }
 
     Option<Mnemonic>::None
+}
+
+fn StringToMnemonic(name: &String) -> Option<Mnemonic> {
+    let found = FindMnemonic(name);
+    if found.IsSome() { return found; }
+    let suffix = if name.EndsWith(".aqrl") { 5usize } else if name.EndsWith(".aq") || name.EndsWith(".rl") { 3usize } else { 0usize };
+    if suffix == 0 { return Option<Mnemonic>::None; }
+
+    match FindMnemonic(name.SubString(0, name.Length() - suffix)) {
+        Option<Mnemonic>::Some(mnemonic) => if mnemonic.IsAtomic() { Option<Mnemonic>::Some(mnemonic) } else { Option<Mnemonic>::None },
+        Option<Mnemonic>::None => Option<Mnemonic>::None
+    }
 }
 
 enum Directive: u8 {
