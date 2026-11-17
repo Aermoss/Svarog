@@ -1,0 +1,270 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "std/str", "std/vec", "std/file", "src/Common/File.zir", "src/Common/Object.zir" : *]
+
+const PROFILE_DUMP_INTERVAL: u64 = 16777216;
+const PROFILE_TOP_FUNCTIONS: usize = 50;
+
+class ProfileSymbol {
+    pub name: String,
+    pub start: u32,
+    pub end: u32;
+
+    ProfileSymbol(&mut this) {}
+
+    ProfileSymbol(&mut this, name: &String, start: u32, end: u32) {
+        (this.name, this.start, this.end) = (name, start, end);
+    }
+}
+
+class ProfileGroup {
+    pub space: u32 = 0,
+    pub total: u64 = 0,
+    pub counts: Vector<u64>;
+
+    ProfileGroup(&mut this) {}
+}
+
+class Profiler {
+    pub enabled: bool = false,
+    path: String,
+    keys: *mut u64 = null,
+    counts: *mut u64 = null,
+    capacity: usize = 0,
+    used: usize = 0,
+    total: u64 = 0,
+    next_dump: u64 = PROFILE_DUMP_INTERVAL,
+    symbols: Vector<ProfileSymbol>,
+    batches: Vector<usize>;
+
+    Profiler(&mut this) {}
+
+    ~Profiler(&mut this) {
+        if this.keys != null { delete[] this.keys; }
+        if this.counts != null { delete[] this.counts; }
+    }
+
+    pub fn Start(&mut this, path: &String) {
+        this.path = path;
+        this.enabled = true;
+        this.Allocate(1048576);
+    }
+
+    fn Allocate(&mut this, capacity: usize) {
+        let (old_keys, old_counts, old_capacity) = (this.keys, this.counts, this.capacity);
+        this.keys = new u64[capacity];
+        this.counts = new u64[capacity];
+        this.capacity = capacity;
+        this.used = 0;
+
+        for i in 0..capacity {
+            this.counts[i] = 0;
+        }
+
+        if old_keys != null {
+            for i in 0..old_capacity {
+                if old_counts[i] != 0 { this.Insert(old_keys[i], old_counts[i]); }
+            }
+
+            delete[] old_keys;
+            delete[] old_counts;
+        }
+    }
+
+    fn Insert(&mut this, key: u64, count: u64) {
+        let mask = this.capacity - 1;
+        let mut slot = ((key * 0x9E3779B97F4A7C15) >> 40) as usize & mask;
+
+        loop {
+            if this.counts[slot] == 0 {
+                this.keys[slot] = key;
+                this.counts[slot] = count;
+                this.used += 1;
+                return;
+            }
+
+            if this.keys[slot] == key {
+                this.counts[slot] += count;
+                return;
+            }
+
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    pub fn Record(&mut this, space: u32, pc: u32) {
+        this.Insert(((space as u64) << 32) | pc as u64, 1);
+        if this.used * 2 > this.capacity { this.Allocate(this.capacity * 2); }
+        this.total += 1;
+
+        if this.total >= this.next_dump {
+            this.next_dump = this.total + PROFILE_DUMP_INTERVAL;
+            this.Dump();
+        }
+    }
+
+    pub fn AddSymbols(&mut this, paths: &Vector<String>, base: u32) -> bool {
+        let mut offset = base;
+        let first = this.symbols.Length();
+
+        for path in paths {
+            let mut file = _File(path);
+            if !file.Open(FileMode::Read) || file.ReadWord() != OBJECT_MAGIC { return false; }
+            let object = Object::Read(file);
+            let end = offset + (object.sections[SectionType::Text as usize].Length() * 4) as u32;
+
+            for symbol in object.symbols {
+                if symbol.section != SectionType::Text || symbol.name.StartsWith(".") || symbol.name.StartsWith("__LBB") { continue; }
+                this.symbols.PushBack(ProfileSymbol(symbol.name, offset + symbol.offset, end));
+            }
+
+            offset = end;
+        }
+
+        for i in (first + 1)..this.symbols.Length() {
+            let mut j = i;
+
+            while j > first && this.symbols[j - 1].start > this.symbols[j].start {
+                let symbol = this.symbols[j];
+                this.symbols[j] = this.symbols[j - 1];
+                this.symbols[j - 1] = symbol;
+                j -= 1;
+            }
+        }
+
+        for i in first..this.symbols.Length() {
+            if i + 1 < this.symbols.Length() && this.symbols[i + 1].start < this.symbols[i].end {
+                this.symbols[i].end = this.symbols[i + 1].start;
+            }
+        }
+
+        this.batches.PushBack(first);
+        true
+    }
+
+    fn FindSymbol(&this, pc: u32) -> usize {
+        let count = this.symbols.Length();
+
+        for b in 0..this.batches.Length() {
+            let first = this.batches[b];
+            let last = if b + 1 < this.batches.Length() { this.batches[b + 1] } else { count };
+            let (mut low, mut high) = (first, last);
+
+            while low < high {
+                let middle = (low + high) / 2;
+                if this.symbols[middle].start <= pc { low = middle + 1; } else { high = middle; }
+            }
+
+            if low > first && pc < this.symbols[low - 1].end { return low - 1; }
+        }
+
+        count
+    }
+
+    fn Hexadecimal(value: u32) -> String {
+        let mut text = String::FromInteger(value as HostUnsigned, 16);
+
+        while text.Length() < 8 {
+            text = "0" + text;
+        }
+
+        "0x" + text
+    }
+
+    fn Percent(part: u64, whole: u64) -> String {
+        let tenths = if whole == 0 { 0u64 } else { part * 1000 / whole };
+        String::FromInteger(tenths / 10) + "." + String::FromInteger(tenths % 10) + "%"
+    }
+
+    fn Pad(text: &String, width: usize) -> String {
+        let mut result = String(text);
+
+        while result.Length() < width {
+            result = " " + result;
+        }
+
+        result
+    }
+
+    pub fn Dump(&this) {
+        let unknown = this.symbols.Length();
+        let mut groups = Vector<ProfileGroup>();
+
+        for slot in 0..this.capacity {
+            let count = this.counts[slot];
+            if count == 0 { continue; }
+            let key = this.keys[slot];
+            let space = (key >> 32) as u32;
+            let mut index = groups.Length();
+
+            for g in 0..groups.Length() {
+                if groups[g].space == space { index = g; break; }
+            }
+
+            if index == groups.Length() {
+                let mut group = ProfileGroup();
+                group.space = space;
+                group.counts.Resize(unknown + 1);
+                for i in 0..(unknown + 1) { group.counts[i] = 0; }
+                groups.PushBack(group);
+            }
+
+            groups[index].total += count;
+            groups[index].counts[this.FindSymbol(key as u32)] += count;
+        }
+
+        for i in 1..groups.Length() {
+            let mut j = i;
+
+            while j > 0 && groups[j - 1].total < groups[j].total {
+                let group = groups[j];
+                groups[j] = groups[j - 1];
+                groups[j - 1] = group;
+                j -= 1;
+            }
+        }
+
+        let mut text = "Instructions: " + String::FromInteger(this.total) + "\n";
+
+        for group in groups {
+            text += "\n" + (if group.space == 0 { "Kernel".ToString() } else { "Page table " + Profiler::Hexadecimal(group.space) }) +
+                ": " + String::FromInteger(group.total) + " instructions, " + Profiler::Percent(group.total, this.total) + "\n";
+            let mut top = Vector<usize>();
+
+            for i in 0..(unknown + 1) {
+                if group.counts[i] == 0 { continue; }
+                let mut position = top.Length();
+
+                while position > 0 && group.counts[top[position - 1]] < group.counts[i] {
+                    position -= 1;
+                }
+
+                if position < PROFILE_TOP_FUNCTIONS {
+                    top.Insert(position, i);
+                    if top.Length() > PROFILE_TOP_FUNCTIONS { top.PopBack(); }
+                }
+            }
+
+            for index in top {
+                let name = if index == unknown { "(unknown)".ToString() } else { String(this.symbols[index].name) };
+                text += Profiler::Pad(String::FromInteger(group.counts[index]), 14) + Profiler::Pad(Profiler::Percent(group.counts[index], group.total), 8) + "  " + name + "\n";
+            }
+        }
+
+        File::WriteText(this.path, text);
+    }
+}

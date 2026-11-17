@@ -15,7 +15,7 @@
  */
 
 #[include "std/io", "std/str", "std/vec", "std/file", "std/thrd", "std/time",
-    "src/Common/File.zir", "src/Common/Endian.zir", "src/Common/Instruction.zir", "src/Emulator/SD.zir" : *]
+    "src/Common/File.zir", "src/Common/Endian.zir", "src/Common/Instruction.zir", "src/Emulator/SD.zir", "src/Emulator/Profiler.zir" : *]
 
 class ConsoleInputRecord {
     pub event_type: u16 = 0,
@@ -154,6 +154,7 @@ class Emulator {
     uart_changed: ConditionVariable,
     output_pending: String,
     output_needed: u32,
+    pub profiler: Profiler,
     pub sd: SDCard;
 
     Emulator(&mut this, quiet: bool, cores: u32) {
@@ -760,6 +761,10 @@ class Emulator {
             return;
         }
 
+        if this.profiler.enabled {
+            this.profiler.Record(if this.core->user_mode { this.core->page_table_base } else { 0 }, this.core->pc);
+        }
+
         let word = this.ReadWord(fetch_address);
         let raw_opcode = word >> OPCODE_SHIFT;
         let opcode = raw_opcode as Opcode;
@@ -1156,6 +1161,10 @@ class Emulator {
 
         while !this.cores[0]->halted {
             this.Tick();
+        }
+
+        if this.profiler.enabled {
+            this.profiler.Dump();
         }
     }
 }

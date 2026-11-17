@@ -17,11 +17,11 @@ __LBB0_3:
 
 	.global	__z5WritePi8
 __z5WritePi8:
-    sw ra, -4(sp)
-    sw fp, -8(sp)
-    addi fp, sp, 0
     addi sp, sp, -12
+    sw ra, 8(sp)
+    sw fp, 4(sp)
     sw s1, 0(sp)
+    addi fp, sp, 12
 __LBB1_0:
     addi s1, a0, 0
 __LBB1_1:
@@ -29,13 +29,16 @@ __LBB1_1:
     andi t0, t0, 255
     bne t0, zero, __LBB1_3
 __LBB1_2:
+    addi sp, fp, -12
     lw s1, 0(sp)
-    lw ra, -4(fp)
-    addi sp, fp, 0
-    lw fp, -8(sp)
+    lw fp, 4(sp)
+    lw ra, 8(sp)
+    addi sp, sp, 12
     br ra
 __LBB1_3:
-    lbu a0, 0(s1)
+    lbu t0, 0(s1)
+    slli t0, t0, 24
+    srai a0, t0, 24
     bl ra, __z14WriteCharacteri8
     addi t0, s1, 1
     addi s1, t0, 0
@@ -43,27 +46,28 @@ __LBB1_3:
 
 	.global	__z9WriteLinePi8
 __z9WriteLinePi8:
-    sw ra, -4(sp)
-    sw fp, -8(sp)
-    addi fp, sp, 0
     addi sp, sp, -8
+    sw ra, 4(sp)
+    sw fp, 0(sp)
+    addi fp, sp, 8
 __LBB2_0:
     bl ra, __z5WritePi8
     li a0, 10
     bl ra, __z14WriteCharacteri8
-    lw ra, -4(fp)
-    addi sp, fp, 0
-    lw fp, -8(sp)
+    addi sp, fp, -8
+    lw fp, 0(sp)
+    lw ra, 4(sp)
+    addi sp, sp, 8
     br ra
 
 	.global	__z12WriteIntegeri32
 __z12WriteIntegeri32:
-    sw ra, -4(sp)
-    sw fp, -8(sp)
-    addi fp, sp, 0
     addi sp, sp, -16
+    sw ra, 12(sp)
+    sw fp, 8(sp)
     sw s1, 0(sp)
     sw s2, 4(sp)
+    addi fp, sp, 16
 __LBB3_0:
     addi s1, a0, 0
     bge s1, zero, __LBB3_5
@@ -82,13 +86,16 @@ __LBB3_3:
 __LBB3_4:
     li t0, 10
     rem t0, s2, t0
-    addi a0, t0, 48
+    addi t0, t0, 48
+    slli t0, t0, 24
+    srai a0, t0, 24
     bl ra, __z14WriteCharacteri8
+    addi sp, fp, -16
     lw s1, 0(sp)
     lw s2, 4(sp)
-    lw ra, -4(fp)
-    addi sp, fp, 0
-    lw fp, -8(sp)
+    lw fp, 8(sp)
+    lw ra, 12(sp)
+    addi sp, sp, 16
     br ra
 __LBB3_5:
     addi s2, s1, 0
@@ -96,11 +103,11 @@ __LBB3_5:
 
 	.global	__z12WriteIntegeru32
 __z12WriteIntegeru32:
-    sw ra, -4(sp)
-    sw fp, -8(sp)
-    addi fp, sp, 0
     addi sp, sp, -12
+    sw ra, 8(sp)
+    sw fp, 4(sp)
     sw s1, 0(sp)
+    addi fp, sp, 12
 __LBB4_0:
     addi s1, a0, 0
     li t0, 10
@@ -112,23 +119,26 @@ __LBB4_1:
 __LBB4_2:
     li t0, 10
     remu t0, s1, t0
-    addi a0, t0, 48
+    addi t0, t0, 48
+    slli t0, t0, 24
+    srai a0, t0, 24
     bl ra, __z14WriteCharacteri8
+    addi sp, fp, -12
     lw s1, 0(sp)
-    lw ra, -4(fp)
-    addi sp, fp, 0
-    lw fp, -8(sp)
+    lw fp, 4(sp)
+    lw ra, 8(sp)
+    addi sp, sp, 12
     br ra
 
 	.global	__z16WriteHexadecimalu32
 __z16WriteHexadecimalu32:
-    sw ra, -4(sp)
-    sw fp, -8(sp)
-    addi fp, sp, 0
     addi sp, sp, -20
+    sw ra, 16(sp)
+    sw fp, 12(sp)
     sw s1, 0(sp)
     sw s2, 4(sp)
     sw s3, 8(sp)
+    addi fp, sp, 20
 __LBB5_0:
     addi s1, a0, 0
     la a0, string.0
@@ -144,11 +154,15 @@ __LBB5_1:
     bltu t0, t1, __LBB5_3
 __LBB5_2:
     subi t0, s3, 10
-    addi a0, t0, 65
+    addi t0, t0, 65
+    slli t0, t0, 24
+    srai a0, t0, 24
     bl ra, __z14WriteCharacteri8
     b __LBB5_4
 __LBB5_3:
-    addi a0, s3, 48
+    addi t0, s3, 48
+    slli t0, t0, 24
+    srai a0, t0, 24
     bl ra, __z14WriteCharacteri8
 __LBB5_4:
     beq s2, zero, __LBB5_6
@@ -158,12 +172,13 @@ __LBB5_5:
     b __LBB5_1
 __LBB5_6:
 __LBB5_7:
+    addi sp, fp, -20
     lw s1, 0(sp)
     lw s2, 4(sp)
     lw s3, 8(sp)
-    lw ra, -4(fp)
-    addi sp, fp, 0
-    lw fp, -8(sp)
+    lw fp, 12(sp)
+    lw ra, 16(sp)
+    addi sp, sp, 20
     br ra
 
 	.global	__z7SetLEDsi8
@@ -175,14 +190,14 @@ __LBB6_0:
 
 	.global	__z9SetWS2812u8u8u8u8
 __z9SetWS2812u8u8u8u8:
-    sw ra, -4(sp)
-    sw fp, -8(sp)
-    addi fp, sp, 0
     addi sp, sp, -36
+    sw ra, 32(sp)
+    sw fp, 28(sp)
     sw s1, 0(sp)
     sw s2, 4(sp)
     sw s3, 8(sp)
     sw s4, 12(sp)
+    addi fp, sp, 36
 __LBB7_0:
     addi s1, a3, 0
     andi t0, a0, 255
@@ -219,13 +234,14 @@ __LBB7_2:
     or t3, t3, t2
     li t4, 63488
     sw t3, 2016(t4)
+    addi sp, fp, -36
     lw s1, 0(sp)
     lw s2, 4(sp)
     lw s3, 8(sp)
     lw s4, 12(sp)
-    lw ra, -4(fp)
-    addi sp, fp, 0
-    lw fp, -8(sp)
+    lw fp, 28(sp)
+    lw ra, 32(sp)
+    addi sp, sp, 36
     br ra
 __LBB7_3:
     addi t2, s4, 0
@@ -239,14 +255,17 @@ __LBB8_0:
     li t0, 63488
     lw t0, 2044(t0)
     andi t0, t0, 1
-    sltu a0, zero, t0
+    sltu t0, zero, t0
+    andi a0, t0, 1
     br ra
 
 	.global	__z13ReadCharacter
 __z13ReadCharacter:
 __LBB9_0:
     li t0, 63488
-    lw a0, 2047(t0)
+    lw t0, 2047(t0)
+    slli t0, t0, 24
+    srai a0, t0, 24
     br ra
 
 	.global	__z13ButtonPressed
@@ -255,7 +274,8 @@ __LBB10_0:
     li t0, 63488
     lw t0, 2036(t0)
     andi t0, t0, 1
-    sltu a0, zero, t0
+    sltu t0, zero, t0
+    andi a0, t0, 1
     br ra
 
 	.global	__z7GetTime
@@ -267,12 +287,12 @@ __LBB11_0:
 
 	.global	__z5Sleepu32
 __z5Sleepu32:
-    sw ra, -4(sp)
-    sw fp, -8(sp)
-    addi fp, sp, 0
     addi sp, sp, -16
+    sw ra, 12(sp)
+    sw fp, 8(sp)
     sw s1, 0(sp)
     sw s2, 4(sp)
+    addi fp, sp, 16
 __LBB12_0:
     addi s1, a0, 0
     bl ra, __z7GetTime
@@ -282,11 +302,12 @@ __LBB12_1:
     sub t0, a0, s2
     bltu t0, s1, __LBB12_3
 __LBB12_2:
+    addi sp, fp, -16
     lw s1, 0(sp)
     lw s2, 4(sp)
-    lw ra, -4(fp)
-    addi sp, fp, 0
-    lw fp, -8(sp)
+    lw fp, 8(sp)
+    lw ra, 12(sp)
+    addi sp, sp, 16
     br ra
 __LBB12_3:
     b __LBB12_1
@@ -302,10 +323,9 @@ __LBB13_0:
 
 	.global	Main
 Main:
-    sw ra, -4(sp)
-    sw fp, -8(sp)
-    addi fp, sp, 0
     addi sp, sp, -180
+    sw ra, 176(sp)
+    sw fp, 172(sp)
     sw s1, 0(sp)
     sw s2, 4(sp)
     sw s3, 8(sp)
@@ -317,6 +337,7 @@ Main:
     sw s9, 32(sp)
     sw s10, 36(sp)
     sw s11, 40(sp)
+    addi fp, sp, 180
 __LBB14_0:
     li a0, 115200
     bl ra, __z11SetBaudRateu32
@@ -475,11 +496,11 @@ __LBB14_18:
 __LBB14_19:
     hlt
 __LBB14_20:
+    lw t5, -16(fp)
+    andi a3, t5, 255
     addi a0, zero, 0
     addi a1, zero, 0
     addi a2, zero, 0
-    lw t5, -16(fp)
-    addi a3, t5, 0
     bl ra, __z9SetWS2812u8u8u8u8
     lw t5, -44(fp)
     addi s7, t5, 0
@@ -492,10 +513,10 @@ __LBB14_20:
     b __LBB14_53
 __LBB14_21:
     li a2, 255
+    lw t5, -16(fp)
+    andi a3, t5, 255
     addi a0, zero, 0
     addi a1, zero, 0
-    lw t5, -16(fp)
-    addi a3, t5, 0
     bl ra, __z9SetWS2812u8u8u8u8
     lw t5, -44(fp)
     addi s7, t5, 0
@@ -508,10 +529,10 @@ __LBB14_21:
     b __LBB14_53
 __LBB14_22:
     li a1, 255
+    lw t5, -16(fp)
+    andi a3, t5, 255
     addi a0, zero, 0
     addi a2, zero, 0
-    lw t5, -16(fp)
-    addi a3, t5, 0
     bl ra, __z9SetWS2812u8u8u8u8
     lw t5, -44(fp)
     addi s7, t5, 0
@@ -524,10 +545,10 @@ __LBB14_22:
     b __LBB14_53
 __LBB14_23:
     li a0, 255
+    lw t5, -16(fp)
+    andi a3, t5, 255
     addi a1, zero, 0
     addi a2, zero, 0
-    lw t5, -16(fp)
-    addi a3, t5, 0
     bl ra, __z9SetWS2812u8u8u8u8
     lw t5, -44(fp)
     addi s7, t5, 0
@@ -704,11 +725,11 @@ __LBB14_51:
     lw t5, -124(fp)
     addi s10, t5, 0
 __LBB14_52:
-    addi a0, s3, 0
-    addi a1, s6, 0
-    addi a2, s1, 0
+    andi a0, s3, 255
+    andi a1, s6, 255
+    andi a2, s1, 255
     lw t5, -16(fp)
-    addi a3, t5, 0
+    andi a3, t5, 255
     bl ra, __z9SetWS2812u8u8u8u8
     addi s7, s1, 0
     addi s11, s6, 0
@@ -754,7 +775,8 @@ __LBB14_58:
 __LBB14_59:
     hlt
 __LBB14_60:
-    addi a0, s8, 0
+    slli t0, s8, 24
+    srai a0, t0, 24
     bl ra, __z14WriteCharacteri8
     lw t5, -40(fp)
     addi s10, t5, 0
@@ -824,7 +846,8 @@ __LBB14_69:
     sll t0, t1, t0
     lw t5, -20(fp)
     xor s6, t5, t0
-    addi a0, s6, 0
+    slli t0, s6, 24
+    srai a0, t0, 24
     bl ra, __z7SetLEDsi8
     lw t5, -40(fp)
     addi s10, t5, 0
@@ -995,7 +1018,7 @@ CLK_FREQ:
 string.0:
 	.byte	48, 120, 0
 string.1:
-	.byte	90, 111, 100, 105, 97, 99, 32, 105, 110, 116, 101, 114, 97, 99, 116, 105
+	.byte	83, 118, 97, 114, 111, 103, 32, 105, 110, 116, 101, 114, 97, 99, 116, 105
 	.byte	118, 101, 32, 116, 101, 114, 109, 105, 110, 97, 108, 32, 105, 110, 105, 116
 	.byte	105, 97, 108, 105, 122, 101, 100, 33, 0
 string.2:

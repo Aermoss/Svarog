@@ -29,8 +29,10 @@ fn PrintUsage(executable: String) {
     WriteLine("OPTIONS:");
     WriteLine("  --cores=<count>          Number of cores to emulate (1 to 32, 2 if not given)");
     WriteLine("  --flash=<file>[@<offset>] Load <file> into flash at <offset>, 0x100000 if not given");
+    WriteLine("  --profile=<file>         Count the executed instructions of each function and write them to <file>");
     WriteLine("  --quiet                  Do not report writes to the LEDs, WS2812 and baud rate");
     WriteLine("  --sd=<file>              Use <file> as the image of the SD card");
+    WriteLine("  --symbols=<objects>[@<address>] Name the functions of the comma separated <objects>, linked in order at <address>, 0xC0000000 if not given");
     WriteLine("  --version                Display emulator version");
     WriteLine("  -h, --help               Display this help message");
 }
@@ -50,6 +52,9 @@ fn Main(args: &mut Vector<String>) -> i32 {
     let mut flash_files = Vector<String>();
     let mut flash_offsets = Vector<u32>();
     let mut card = String();
+    let mut profile = String();
+    let mut symbol_files = Vector<Vector<String>>();
+    let mut symbol_bases = Vector<u32>();
     let mut i: usize = 1;
 
     while i < args.Length() {
@@ -72,6 +77,35 @@ fn Main(args: &mut Vector<String>) -> i32 {
             }
 
             cores = count.Unwrap() as u32;
+        } else if arg.StartsWith("--profile=") {
+            profile = arg.SubString(10);
+        } else if arg.StartsWith("--symbols=") {
+            let parts = arg.SubString(10).Split('@');
+            let mut base: u32 = 0xC0000000;
+
+            if parts.Length() > 1 {
+                let text = parts[1];
+                let value = if text.StartsWith("0x") { String::ToInteger(text.SubString(2), 16) } else { String::ToInteger(text, 10) };
+
+                if value.IsNone() {
+                    Logger::Log("Invalid symbol address '" + text + "'.", LogSeverity::Error);
+                    return 1;
+                }
+
+                base = value.Unwrap() as u32;
+            }
+
+            let files = parts[0].Split(',');
+
+            for file in files {
+                if !FileExists(file) {
+                    Logger::Log("Cannot find '" + file + "'.", LogSeverity::Error);
+                    return 1;
+                }
+            }
+
+            symbol_files.PushBack(files);
+            symbol_bases.PushBack(base);
         } else if arg.StartsWith("--sd=") {
             card = arg.SubString(5);
 
@@ -130,6 +164,17 @@ fn Main(args: &mut Vector<String>) -> i32 {
     if !card.Empty() && !emulator.sd.Open(card) {
         Logger::Log("Failed to open the SD card image '" + card + "'.", LogSeverity::Error);
         return 1;
+    }
+
+    if !profile.Empty() {
+        emulator.profiler.Start(profile);
+
+        for j in 0..symbol_files.Length() {
+            if !emulator.profiler.AddSymbols(symbol_files[j], symbol_bases[j]) {
+                Logger::Log("Failed to read the symbols of '" + symbol_files[j][0] + "'.", LogSeverity::Error);
+                return 1;
+            }
+        }
     }
 
     emulator.Emulate();
