@@ -1,0 +1,102 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module BRAM(
+    clk: in clock,
+    fetch_address: in u32,
+    fetch_hold: in bool,
+    fetch_word: out u32,
+    data_address: in u32,
+    data_hold: in bool,
+    data_word: out u32,
+    write: in bool,
+    write_address: in u32,
+    write_data: in u32,
+    write_mask: in u4
+) {
+    reg lane0: [u8; 4096] = readmemh("C:/Users/rencb/Documents/GitHub/Svarog/boot0.hex");
+    reg lane1: [u8; 4096] = readmemh("C:/Users/rencb/Documents/GitHub/Svarog/boot1.hex");
+    reg lane2: [u8; 4096] = readmemh("C:/Users/rencb/Documents/GitHub/Svarog/boot2.hex");
+    reg lane3: [u8; 4096] = readmemh("C:/Users/rencb/Documents/GitHub/Svarog/boot3.hex");
+    reg fetch0: u8;
+    reg fetch1: u8;
+    reg fetch2: u8;
+    reg fetch3: u8;
+    reg data0: u8;
+    reg data1: u8;
+    reg data2: u8;
+    reg data3: u8;
+
+    let fetch_index = fetch_address[13:2];
+    let port = if write { write_address[13:2] } else { data_address[13:2] };
+    let port_read = !write && !data_hold;
+    let write0 = write && write_mask[0];
+    let write1 = write && write_mask[1];
+    let write2 = write && write_mask[2];
+    let write3 = write && write_mask[3];
+
+    fetch_word = cat(fetch3, fetch2, fetch1, fetch0);
+    data_word = cat(data3, data2, data1, data0);
+
+    seq(clk) {
+        if !fetch_hold {
+            fetch0 <- lane0[fetch_index];
+            fetch1 <- lane1[fetch_index];
+            fetch2 <- lane2[fetch_index];
+            fetch3 <- lane3[fetch_index];
+        }
+    }
+
+    seq(clk) {
+        if write0 || port_read {
+            if write0 {
+                lane0[port] <- write_data[7:0];
+            } else {
+                data0 <- lane0[port];
+            }
+        }
+    }
+
+    seq(clk) {
+        if write1 || port_read {
+            if write1 {
+                lane1[port] <- write_data[15:8];
+            } else {
+                data1 <- lane1[port];
+            }
+        }
+    }
+
+    seq(clk) {
+        if write2 || port_read {
+            if write2 {
+                lane2[port] <- write_data[23:16];
+            } else {
+                data2 <- lane2[port];
+            }
+        }
+    }
+
+    seq(clk) {
+        if write3 || port_read {
+            if write3 {
+                lane3[port] <- write_data[31:24];
+            } else {
+                data3 <- lane3[port];
+            }
+        }
+    }
+}

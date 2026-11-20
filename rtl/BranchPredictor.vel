@@ -1,0 +1,129 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+const KIND_JUMP: u2 = 0;
+const KIND_CALL: u2 = 1;
+const KIND_RETURN: u2 = 2;
+
+module BranchPredictor(
+    clk: in clock,
+    rst: in reset,
+    fetch_pc: in u32,
+    predict_taken: out bool,
+    predict_target: out u32,
+    predict_hit: out bool,
+    predict_counter: out u2,
+    predict_call: out bool,
+    predict_return: out bool,
+    push: in bool,
+    pop: in bool,
+    push_address: in u32,
+    bypass_near: in bool,
+    near_address: in u32,
+    bypass_far: in bool,
+    far_address: in u32,
+    return_offset: in u2,
+    redirect: in bool,
+    update: in bool,
+    update_pc: in u32,
+    update_taken: in bool,
+    update_target: in u32,
+    update_call: in bool,
+    update_return: in bool,
+    update_hit: in bool,
+    update_counter: in u2,
+    return_address: in u32
+) {
+    reg valid: u64 = 0;
+    reg tags: [u12; 64];
+    reg targets: [u30; 64];
+    reg counters: [u2; 64];
+    reg kinds: [u2; 64];
+    reg returns: [u30; 8];
+    reg return_top: u3 = 0;
+    reg committed_top: u3 = 0;
+    wire next_counter: u2;
+
+    let fetch_index = fetch_pc[7:2];
+    let update_index = update_pc[7:2];
+    let fetch_tag = cat(fetch_pc[31:30], fetch_pc[17:8]);
+    let update_tag = cat(update_pc[31:30], update_pc[17:8]);
+    let fetch_kind = kinds[fetch_index];
+    let return_peek = return_top - (return_offset as u3);
+    let return_target = if bypass_near { near_address[31:2] } else if bypass_far { far_address[31:2] } else { returns[return_peek] };
+    let commit_push = update && update_call;
+    let commit_pop = update && update_return;
+    let committed_next = if commit_push { committed_top + 1 } else if commit_pop { committed_top - 1 } else { committed_top };
+    let write = update && (update_taken || update_hit);
+
+    predict_hit = valid[fetch_index] && tags[fetch_index] == fetch_tag;
+    predict_counter = counters[fetch_index];
+    predict_taken = predict_hit && predict_counter[1];
+    predict_target = cat(if fetch_kind == KIND_RETURN { return_target } else { targets[fetch_index] }, 0 as u2);
+    predict_call = fetch_kind == KIND_CALL;
+    predict_return = fetch_kind == KIND_RETURN;
+
+    comb {
+        next_counter = 2;
+
+        if update_hit {
+            if update_taken {
+                next_counter = if update_counter == 3 { 3 } else { update_counter + 1 };
+            } else {
+                next_counter = if update_counter == 0 { 0 } else { update_counter - 1 };
+            }
+        }
+    }
+
+    seq(clk) {
+        if write {
+            tags[update_index] <- update_tag;
+            targets[update_index] <- update_target[31:2];
+            counters[update_index] <- next_counter;
+            kinds[update_index] <- if update_return { KIND_RETURN } else if update_call { KIND_CALL } else { KIND_JUMP };
+        }
+    }
+
+    seq(clk) {
+        if rst {
+            for i in 0..8 {
+                returns[i] <- 0;
+            }
+        } else if redirect {
+            if commit_push {
+                returns[committed_next] <- return_address[31:2];
+            }
+        } else if push {
+            returns[return_top + 1] <- push_address[31:2];
+        }
+    }
+
+    seq {
+        if write {
+            valid[update_index] <- true;
+        }
+
+        committed_top <- committed_next;
+
+        if redirect {
+            return_top <- committed_next;
+        } else if push {
+            return_top <- return_top + 1;
+        } else if pop {
+            return_top <- return_top - 1;
+        }
+    }
+}

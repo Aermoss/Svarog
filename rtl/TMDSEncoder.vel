@@ -1,0 +1,86 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module TMDSEncoder(
+    clk: in clock,
+    rst: in reset,
+    data: in u8,
+    control: in u2,
+    active: in bool,
+    symbol: out reg u10 = 0b1101010100
+) {
+    reg disparity: i6 = 0;
+    wire data_ones: u4;
+    wire q_m: u9;
+    wire q_m_ones: u4;
+
+    let use_xnor = data_ones > 4 || (data_ones == 4 && !data[0]);
+    let balance = (((cat(false, q_m_ones, false) as i6) - 8) as i5);
+    let balance_wide = balance as i6;
+
+    comb {
+        data_ones = 0;
+
+        for i in 0..8 {
+            if data[i] {
+                data_ones = data_ones + 1;
+            }
+        }
+    }
+
+    comb {
+        q_m = 0;
+        q_m[0] = data[0];
+
+        for i in 1..8 {
+            q_m[i] = if use_xnor { !(q_m[i - 1] ^ data[i]) } else { q_m[i - 1] ^ data[i] };
+        }
+
+        q_m[8] = !use_xnor;
+    }
+
+    comb {
+        q_m_ones = 0;
+
+        for i in 0..8 {
+            if q_m[i] {
+                q_m_ones = q_m_ones + 1;
+            }
+        }
+    }
+
+    seq {
+        if !active {
+            disparity <- 0;
+
+            match control {
+                0 => symbol <- 0b1101010100,
+                1 => symbol <- 0b0010101011,
+                2 => symbol <- 0b0101010100,
+                _ => symbol <- 0b1010101011
+            }
+        } else if disparity == 0 || balance == 0 {
+            symbol <- cat(!q_m[8], q_m[8], if q_m[8] { q_m[7:0] } else { !q_m[7:0] });
+            disparity <- if q_m[8] { disparity + balance_wide } else { disparity - balance_wide };
+        } else if (disparity > 0 && balance > 0) || (disparity < 0 && balance < 0) {
+            symbol <- cat(true, q_m[8], !q_m[7:0]);
+            disparity <- disparity + (if q_m[8] { 2 as i6 } else { 0 as i6 }) - balance_wide;
+        } else {
+            symbol <- cat(false, q_m[8], q_m[7:0]);
+            disparity <- disparity - (if q_m[8] { 0 as i6 } else { 2 as i6 }) + balance_wide;
+        }
+    }
+}

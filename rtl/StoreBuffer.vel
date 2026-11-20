@@ -1,0 +1,79 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+const BUFFER_DEPTH = 8;
+
+module StoreBuffer(
+    clk: in clock,
+    rst: in reset,
+    push: in bool,
+    push_address: in u21,
+    push_data: in u32,
+    push_dqm: in u4,
+    pop: in bool,
+    empty: out bool,
+    count: out reg u4 = 0,
+    head_address: out u21,
+    head_data: out u32,
+    head_dqm: out u4,
+    lines: out u144,
+    valid: out u8
+) {
+    reg addresses: [u21; 8];
+    reg data: [u32; 8];
+    reg dqms: [u4; 8];
+    reg head: u3 = 0;
+    reg tail: u3 = 0;
+
+    empty = count == 0;
+    head_address = addresses[head];
+    head_data = data[head];
+    head_dqm = dqms[head];
+
+    comb {
+        lines = 0;
+        valid = 0;
+
+        for i in 0..8 {
+            lines[i * 18 + 17:i * 18] = addresses[i][20:3];
+            valid[i] = (((i as u3) - head) as u4) < count;
+        }
+    }
+
+    seq(clk) {
+        if push {
+            addresses[tail] <- push_address;
+            data[tail] <- push_data;
+            dqms[tail] <- push_dqm;
+        }
+    }
+
+    seq {
+        if push {
+            tail <- tail + 1;
+        }
+
+        if pop {
+            head <- head + 1;
+        }
+
+        if push && !pop {
+            count <- count + 1;
+        } else if pop && !push {
+            count <- count - 1;
+        }
+    }
+}

@@ -1,0 +1,234 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+const CLK_FREQ = 81_000_000;
+const REFRESH_CYCLES = CLK_FREQ / 1_000_000 * 15;
+const CALIBRATION_ADDRESS: u21 = 0x1FFFFC;
+
+enum SdramState { Idle, Refresh, ActivateWait, CommandWait, ReadWait, ReadData, ReadAck }
+
+module SDRAM(
+    clk: in clock,
+    rst: in reset,
+    start: in bool,
+    write: in bool,
+    length: in u3,
+    address: in u21,
+    data: in u32,
+    dqm: in u4,
+    ready: out bool,
+    read_valid: out bool,
+    read_data: out u32,
+    sdrc_cmd_en: out reg bool = false,
+    sdrc_cmd: out reg u3 = 0,
+    sdrc_addr: out u21,
+    sdrc_data_w: out u32,
+    sdrc_dqm: out u4,
+    sdrc_data_len: out u8,
+    sdrc_data_r: in u32,
+    sdrc_init_done: in bool,
+    sdrc_cmd_ack: in bool
+) {
+    reg state: SdramState = SdramState::Idle;
+    reg reading: bool = false;
+    reg acknowledged: bool = false;
+    reg delay: u3 = 0;
+    reg remaining: u3 = 0;
+    reg refresh_counter: u11 = 0;
+    reg refresh_pending: bool = false;
+    reg active_address: u21 = 0;
+    reg active_data: u32 = 0;
+    reg active_dqm: u4 = 0;
+    reg active_length: u3 = 0;
+    reg internal: bool = false;
+    reg latency: u3 = 5;
+    reg calibrated: bool = false;
+    reg calibration_step: u3 = 0;
+    reg attempts: u2 = 0;
+    reg watching: bool = false;
+    reg watch_cycle: u4 = 0;
+    reg matched: u2 = 0;
+    wire pattern: u32;
+    wire expected: u32;
+
+    let first_cycle = watch_cycle - 3;
+    let idle = state == SdramState::Idle && !refresh_pending && sdrc_init_done;
+    let calibration_request = !calibrated && idle && calibration_step <= 4;
+    let request = if calibrated { start } else { calibration_request };
+    let request_write = if calibrated { write } else { calibration_step != 4 };
+    let request_length = if calibrated { length } else { 3 as u3 };
+    let request_address = if calibrated { address } else { CALIBRATION_ADDRESS + (calibration_step[1:0] as u21) };
+    let request_data = if calibrated { data } else { pattern };
+    let request_dqm = if calibrated { dqm } else { 0 as u4 };
+
+    ready = idle && calibrated;
+    read_valid = state == SdramState::ReadData && !internal;
+    read_data = sdrc_data_r;
+    sdrc_addr = active_address;
+    sdrc_data_w = active_data;
+    sdrc_dqm = active_dqm;
+    sdrc_data_len = active_length as u8;
+
+    comb {
+        pattern = 0xB4A59687;
+
+        match calibration_step[1:0] {
+            0 => pattern = 0x13579BDF,
+            1 => pattern = 0xECA86420,
+            2 => pattern = 0x0F1E2D3C,
+            _ => {}
+        }
+    }
+
+    comb {
+        expected = 0xB4A59687;
+
+        match matched {
+            0 => expected = 0x13579BDF,
+            1 => expected = 0xECA86420,
+            2 => expected = 0x0F1E2D3C,
+            _ => {}
+        }
+    }
+
+    seq {
+        if calibration_request {
+            calibration_step <- calibration_step + 1;
+        }
+
+        if !calibrated && !watching && sdrc_cmd_en && sdrc_cmd == 0b101 {
+            watching <- true;
+            watch_cycle <- 1;
+            matched <- 0;
+        }
+
+        if watching {
+            watch_cycle <- watch_cycle + 1;
+
+            if sdrc_data_r == expected {
+                matched <- matched + 1;
+
+                if matched == 3 && watch_cycle >= 4 && watch_cycle <= 10 {
+                    latency <- first_cycle[2:0];
+                    calibrated <- true;
+                    watching <- false;
+                }
+            } else if sdrc_data_r == 0x13579BDF {
+                matched <- 1;
+            } else {
+                matched <- 0;
+            }
+
+            if watch_cycle == 15 {
+                watching <- false;
+                attempts <- attempts + 1;
+
+                if attempts + 1 == 3 {
+                    calibrated <- true;
+                } else {
+                    calibration_step <- 0;
+                }
+            }
+        }
+
+        if sdrc_init_done {
+            if refresh_counter == REFRESH_CYCLES - 1 {
+                refresh_counter <- 0;
+                refresh_pending <- true;
+            } else {
+                refresh_counter <- refresh_counter + 1;
+            }
+        }
+
+        match state {
+            SdramState::Idle => {
+                if refresh_pending {
+                    refresh_pending <- false;
+                    sdrc_cmd_en <- true;
+                    sdrc_cmd <- 0b001;
+                    state <- SdramState::Refresh;
+                } else if request {
+                    sdrc_cmd_en <- true;
+                    sdrc_cmd <- 0b011;
+                    active_address <- request_address;
+                    active_data <- request_data;
+                    active_dqm <- request_dqm;
+                    active_length <- if request_write { 0 } else { request_length };
+                    reading <- !request_write;
+                    internal <- !calibrated;
+                    state <- SdramState::ActivateWait;
+                }
+            },
+            SdramState::Refresh => {
+                sdrc_cmd_en <- false;
+
+                if sdrc_cmd_ack {
+                    state <- SdramState::Idle;
+                }
+            },
+            SdramState::ActivateWait => {
+                sdrc_cmd_en <- false;
+
+                if sdrc_cmd_ack {
+                    sdrc_cmd_en <- true;
+                    sdrc_cmd <- if reading { 0b101 } else { 0b100 };
+                    acknowledged <- false;
+                    delay <- latency;
+                    remaining <- active_length;
+                    state <- if reading { SdramState::ReadWait } else { SdramState::CommandWait };
+                }
+            },
+            SdramState::CommandWait => {
+                sdrc_cmd_en <- false;
+
+                if sdrc_cmd_ack {
+                    state <- SdramState::Idle;
+                }
+            },
+            SdramState::ReadWait => {
+                sdrc_cmd_en <- false;
+
+                if sdrc_cmd_ack {
+                    acknowledged <- true;
+                }
+
+                if delay > 1 {
+                    delay <- delay - 1;
+                } else {
+                    state <- SdramState::ReadData;
+                }
+            },
+            SdramState::ReadData => {
+                if sdrc_cmd_ack {
+                    acknowledged <- true;
+                }
+
+                if remaining != 0 {
+                    remaining <- remaining - 1;
+                } else if acknowledged || sdrc_cmd_ack {
+                    state <- SdramState::Idle;
+                } else {
+                    state <- SdramState::ReadAck;
+                }
+            },
+            SdramState::ReadAck => {
+                if sdrc_cmd_ack {
+                    state <- SdramState::Idle;
+                }
+            }
+        }
+    }
+}

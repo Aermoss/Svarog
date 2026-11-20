@@ -1,0 +1,105 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module SPI(
+    clk: in clock,
+    rst: in reset,
+    data_write: in bool,
+    write_data: in u8,
+    read_data: out u8,
+    control_write: in bool,
+    control_data: in u5,
+    status: out u5,
+    divisor_write: in bool,
+    divisor_data: in u8,
+    divisor: out reg u8 = 68,
+    sclk: out reg bool = false,
+    mosi: out reg bool = true,
+    miso: in bool,
+    cs_n: out reg bool = true
+) {
+    reg cpol: bool = false;
+    reg cpha: bool = false;
+    reg lsb_first: bool = false;
+    reg busy: bool = false;
+    reg shift: u8 = 0xFF;
+    reg received: u8 = 0xFF;
+    reg edges: u5 = 0;
+    reg timer: u8 = 0;
+
+    let edge_number = edges + 1;
+    let leading = edge_number[0];
+    let next_bit = if lsb_first { shift[0] } else { shift[7] };
+    let shifted = if lsb_first { cat(true, shift[7:1]) } else { cat(shift[6:0], true) };
+
+    read_data = received;
+    status = cat(lsb_first, cpha, cpol, busy, !cs_n);
+
+    seq {
+        if control_write {
+            cs_n <- !control_data[0];
+
+            if !busy {
+                lsb_first <- control_data[4];
+                cpha <- control_data[3];
+                cpol <- control_data[2];
+                sclk <- control_data[2];
+            }
+        }
+
+        if divisor_write {
+            divisor <- if divisor_data == 0 { 1 } else { divisor_data };
+        }
+
+        if data_write && !busy {
+            busy <- true;
+            edges <- 0;
+            timer <- divisor - 1;
+
+            if cpha {
+                shift <- write_data;
+            } else {
+                mosi <- if lsb_first { write_data[0] } else { write_data[7] };
+                shift <- if lsb_first { cat(true, write_data[7:1]) } else { cat(write_data[6:0], true) };
+            }
+        } else if busy {
+            if timer != 0 {
+                timer <- timer - 1;
+            } else {
+                timer <- divisor - 1;
+                edges <- edge_number;
+                sclk <- !sclk;
+
+                if leading != cpha {
+                    received <- if lsb_first { cat(miso, received[7:1]) } else { cat(received[6:0], miso) };
+                }
+
+                if (cpha && leading) || (!cpha && !leading && edge_number != 16) {
+                    mosi <- next_bit;
+                    shift <- shifted;
+                }
+
+                if edge_number == 16 {
+                    busy <- false;
+
+                    if !cpha {
+                        mosi <- true;
+                    }
+                }
+            }
+        }
+    }
+}

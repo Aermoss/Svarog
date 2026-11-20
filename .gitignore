@@ -20,3 +20,6 @@
 !bin/svarog-strings.exe
 
 !font.hex
+
+rtl/build/
+build/

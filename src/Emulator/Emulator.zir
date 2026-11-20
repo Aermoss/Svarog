@@ -54,7 +54,7 @@ fn KeySequence(virtual_key: u32) -> *i8 {
     }
 }
 
-const CLK_FREQ: u32 = 54000000;
+const CLK_FREQ: u32 = 81000000;
 const CYCLES_PER_MS: u32 = CLK_FREQ / 1000;
 
 const SDRAM_START: u32 = 0x40000000;
@@ -155,6 +155,25 @@ class Emulator {
     output_pending: String,
     output_needed: u32,
     pub profiler: Profiler,
+    following: bool = false,
+    injected: u32 = 0,
+    trapped: bool = false,
+    written: bool = false,
+    written_index: u32 = 0,
+    written_value: u32 = 0,
+    store_address: u32 = 0,
+    store_data: u32 = 0,
+    store_mask: u32 = 0,
+    last_virtual: u32 = 0,
+    ahead: [bool; 32],
+    ahead_pc: [u32; 32],
+    ahead_written: [bool; 32],
+    ahead_index: [u32; 32],
+    ahead_value: [u32; 32],
+    ahead_store_address: [u32; 32],
+    ahead_store_data: [u32; 32],
+    ahead_store_mask: [u32; 32],
+    ahead_virtual: [u32; 32],
     pub sd: SDCard;
 
     Emulator(&mut this, quiet: bool, cores: u32) {
@@ -263,7 +282,14 @@ class Emulator {
     fn SetRegister(&mut this, index: u32, value: u32) {
         if index != 0 {
             this.core->registers[index as usize] = value;
+            (this.written, this.written_index, this.written_value) = (true, index, value);
         }
+    }
+
+    fn RecordStore(&mut this, address: u32, data: u32, mask: u32) {
+        this.store_address = address & !3u32;
+        this.store_data |= data;
+        this.store_mask |= mask;
     }
 
     fn IsDevice(&this, address: u32) -> bool {
@@ -314,6 +340,8 @@ class Emulator {
             this.core->page_table_base
         } else if index == CSR::ASID as u32 {
             this.core->address_space
+        } else if this.following && (index == CSR::CYCLE as u32 || index == CSR::TIME as u32 || index == CSR::IPENDING as u32) {
+            this.injected
         } else if index == CSR::CYCLE as u32 {
             this.cycle_counter as u32
         } else if index == CSR::INSTRET as u32 {
@@ -441,6 +469,7 @@ class Emulator {
     }
 
     fn Trap(&mut this, cause: u32, epc: u32, address: u32) {
+        this.trapped = true;
         this.core->reservation_valid = false;
         (this.core->trap_pc, this.core->trap_cause, this.core->trap_address) = (epc, cause, address);
         (this.core->previous_interrupt_enable, this.core->interrupt_enable) = (this.core->interrupt_enable, false);
@@ -504,7 +533,9 @@ class Emulator {
     }
 
     fn ReadByte(&mut this, address: u32) -> u8 {
-        if this.IsDevice(address) {
+        if this.following && this.IsDevice(address) {
+            (this.injected & 0xFF) as u8
+        } else if this.IsDevice(address) {
             ((this.ReadDevice(address) >> (8 * (address & 3))) & 0xFF) as u8
         } else if (address & 0xC0000000) == 0x80000000 {
             this.flash[(address & 0x7FFFFF) as usize]
@@ -518,7 +549,9 @@ class Emulator {
     }
 
     fn ReadHalf(&mut this, address: u32) -> u16 {
-        if this.IsDevice(address) {
+        if this.following && this.IsDevice(address) {
+            (this.injected & 0xFFFF) as u16
+        } else if this.IsDevice(address) {
             ((this.ReadDevice(address) >> (16 * ((address >> 1) & 1))) & 0xFFFF) as u16
         } else {
             let mut result = this.ReadByte(address) as u32;
@@ -528,7 +561,9 @@ class Emulator {
     }
 
     fn ReadWord(&mut this, address: u32) -> u32 {
-        if this.IsDevice(address) {
+        if this.following && this.IsDevice(address) {
+            this.injected
+        } else if this.IsDevice(address) {
             this.ReadDevice(address)
         } else {
             let mut result = this.ReadByte(address) as u32;
@@ -540,6 +575,8 @@ class Emulator {
     }
 
     fn WriteByte(&mut this, address: u32, value: u8) {
+        this.RecordStore(address, (value as u32) << (8 * (address & 3)), 1u32 << (address & 3));
+
         if address == 0xFFFF {
             this.WriteOutput(value);
         } else if address == 0xFFB8 {
@@ -566,6 +603,10 @@ class Emulator {
     }
 
     fn WriteWord(&mut this, address: u32, value: u32) {
+        if address == 0xFFE0 || address == 0xFFF8 || address == 0xFFDC || address == 0xFFA8 || address == 0xFFA4 || address == 0xFFA0 || this.IsSpinlock(address) {
+            this.RecordStore(address, value, 0xF);
+        }
+
         match address {
             0xFFE0 => {
                 if !this.quiet {
@@ -738,7 +779,7 @@ class Emulator {
             this.core->waiting = false;
         }
 
-        let interrupts = if this.core->interrupt_enable {
+        let interrupts = if this.core->interrupt_enable && !this.following {
             this.GetPendingInterrupts(this.core->interrupt_mask)
         } else { 0 };
 
@@ -793,6 +834,7 @@ class Emulator {
 
         if is_load || is_store || is_atomic {
             let virtual_address = if is_atomic { this.GetRegister(reg1) } else { (this.GetRegister(reg1) as i32 + simm16) as u32 };
+            this.last_virtual = virtual_address;
 
             if !this.Translate(virtual_address, if is_store { Access::Store } else { Access::Load }, &mut address) {
                 this.Trap(if is_store { TrapCause::StoreFault as u32 } else { TrapCause::LoadFault as u32 }, this.core->pc, virtual_address);
@@ -1001,7 +1043,9 @@ class Emulator {
                 (this.core->user_mode, this.core->previous_user) = (this.core->previous_user, false);
             },
             Opcode::WFI => {
-                this.WaitForInterrupt();
+                if !this.following {
+                    this.WaitForInterrupt();
+                }
             },
             Opcode::LR => {
                 let value = this.ReadWord(address);
@@ -1009,7 +1053,7 @@ class Emulator {
                 this.SetRegister(reg0, value);
             },
             Opcode::SC => {
-                let success = this.core->reservation_valid && (this.core->reservation_address & !3u32) == (address & !3u32);
+                let success = this.core->reservation_valid && (this.core->reservation_address & !3u32) == (address & !3u32) && (!this.following || this.injected == 0);
                 if success { this.WriteWord(address, this.GetRegister(reg2)); }
                 this.core->reservation_valid = false;
                 this.SetRegister(reg0, if success { 0 } else { 1 });
@@ -1152,6 +1196,181 @@ class Emulator {
                 this.ReceiveKey(record, high_surrogate);
             }
         }
+    }
+
+    fn Mismatch(&this, count: u32, line: &String, reason: &String) -> i32 {
+        WriteLine("FOLLOW MISMATCH at record " + String::FromInteger(count as u64) + ": " + reason);
+        WriteLine("  record:   " + line);
+        WriteLine("  emulator: pc " + String::FromInteger(this.core->pc as u64, 16) + " write " + (if this.written { String::FromInteger(this.written_index as u64) + "=" + String::FromInteger(this.written_value as u64, 16) } else { "-".ToString() }) +
+            " store " + String::FromInteger(this.store_address as u64, 16) + "=" + String::FromInteger(this.store_data as u64, 16) + "/" + String::FromInteger(this.store_mask as u64, 16) +
+            " cause " + String::FromInteger(this.core->trap_cause as u64, 16) + " epc " + String::FromInteger(this.core->trap_pc as u64, 16) + " badaddr " + String::FromInteger(this.core->trap_address as u64, 16));
+        1
+    }
+
+    fn AllHalted(&this) -> bool {
+        for i in 0..this.core_count {
+            let core = this.cores[i as usize];
+            if core->running && !core->halted { return false; }
+        }
+
+        true
+    }
+
+    pub fn Follow(&mut this, path: &String) -> i32 {
+        this.following = true;
+        let content = File::ReadText(path).Unwrap();
+        let mut count: u32 = 0;
+
+        for i in 0..32 {
+            this.ahead[i as usize] = false;
+        }
+
+        for raw_line in content.Split('\n') {
+            let line = raw_line.Strip();
+            let fields = line.Split(' ');
+            if fields.Length() == 0 { continue; }
+            let mut base: usize = 0;
+            let mut index: u32 = 0;
+
+            if fields[0].StartsWith("C") {
+                let number = fields[0].SubString(1).ToUnsignedInteger();
+                if number.IsNone() { continue; }
+                index = number.Unwrap() as u32;
+                base = 1;
+            }
+
+            if fields.Length() < base + 3 { continue; }
+            count += 1;
+            (this.trapped, this.written, this.store_mask, this.store_data, this.store_address) = (false, false, 0, 0, 0);
+
+            if index >= this.core_count {
+                return this.Mismatch(count, line, "record for core " + String::FromInteger(index as u64) + ", but only " + String::FromInteger(this.core_count as u64) + " cores are emulated; pass --cores".ToString());
+            }
+
+            this.core = this.cores[index as usize];
+
+            if !this.core->running {
+                return this.Mismatch(count, line, "record for a core that has not been started".ToString());
+            }
+
+            this.core->waiting = false;
+            let pc = this.core->pc;
+
+            if fields[base] == "P" {
+                let address = fields[base + 1].ToInteger(16).Unwrap() as u32;
+                let value = fields[base + 2].ToInteger(16).Unwrap() as u32;
+                let slot = index as usize;
+
+                if this.ahead[slot] {
+                    return this.Mismatch(count, line, "second transaction before the first one committed".ToString());
+                }
+
+                this.injected = value;
+                this.Step();
+
+                if this.trapped {
+                    return this.Mismatch(count, line, "emulator trapped at a transaction".ToString());
+                }
+
+                if (this.last_virtual & !3u32) != (address & !3u32) {
+                    return this.Mismatch(count, line, "different transaction address".ToString());
+                }
+
+                this.ahead[slot] = true;
+                this.ahead_pc[slot] = pc;
+                this.ahead_written[slot] = this.written;
+                this.ahead_index[slot] = this.written_index;
+                this.ahead_value[slot] = this.written_value;
+                this.ahead_store_address[slot] = this.store_address;
+                this.ahead_store_data[slot] = this.store_data;
+                this.ahead_store_mask[slot] = this.store_mask;
+                this.ahead_virtual[slot] = this.last_virtual;
+                continue;
+            }
+
+            if fields.Length() < base + 4 { continue; }
+
+            if fields[base] == "X" {
+                if this.ahead[index as usize] {
+                    return this.Mismatch(count, line, "trap between a transaction and its commit".ToString());
+                }
+
+                let cause = fields[base + 1].ToInteger(16).Unwrap() as u32;
+                let epc = fields[base + 2].ToInteger(16).Unwrap() as u32;
+                let address = fields[base + 3].ToInteger(16).Unwrap() as u32;
+
+                if (cause & 0x80000000) != 0 {
+                    if pc != epc {
+                        return this.Mismatch(count, line, "interrupt at a different pc".ToString());
+                    }
+
+                    this.Trap(cause, pc, 0);
+                    continue;
+                }
+
+                this.Step();
+
+                if !this.trapped || this.core->trap_cause != cause || this.core->trap_pc != epc || this.core->trap_address != address {
+                    return this.Mismatch(count, line, "different trap".ToString());
+                }
+
+                continue;
+            }
+
+            if fields.Length() < base + 7 { continue; }
+            let record_pc = fields[base + 1].ToInteger(16).Unwrap() as u32;
+            let rd = fields[base + 2].ToInteger(16).Unwrap() as u32;
+            let value = fields[base + 3].ToInteger(16).Unwrap() as u32;
+            let address = fields[base + 4].ToInteger(16).Unwrap() as u32;
+            let data = fields[base + 5].ToInteger(16).Unwrap() as u32;
+            let mask = fields[base + 6].ToInteger(16).Unwrap() as u32;
+            let slot = index as usize;
+
+            if this.ahead[slot] {
+                if this.ahead_pc[slot] != record_pc {
+                    return this.Mismatch(count, line, "commit of a different instruction than the transaction".ToString());
+                }
+
+                this.ahead[slot] = false;
+                (this.written, this.written_index, this.written_value) = (this.ahead_written[slot], this.ahead_index[slot], this.ahead_value[slot]);
+                (this.store_address, this.store_data, this.store_mask) = (this.ahead_store_address[slot], this.ahead_store_data[slot], this.ahead_store_mask[slot]);
+                this.last_virtual = this.ahead_virtual[slot];
+            } else {
+                if pc != record_pc {
+                    return this.Mismatch(count, line, "different pc".ToString());
+                }
+
+                this.injected = value;
+                this.Step();
+            }
+
+            if this.trapped {
+                return this.Mismatch(count, line, "emulator trapped".ToString());
+            }
+
+            let written_rd = if this.written { this.written_index } else { 0 };
+
+            if written_rd != rd || (rd != 0 && this.written_value != value) {
+                return this.Mismatch(count, line, "different register write".ToString());
+            }
+
+            let mut bits: u32 = 0;
+
+            for lane in 0u32..4 {
+                if (mask & (1u32 << lane)) != 0 { bits |= 0xFFu32 << (8 * lane); }
+            }
+
+            if this.store_mask != mask || (mask != 0 && ((this.last_virtual & !3u32) != address || (this.store_data & bits) != (data & bits))) {
+                return this.Mismatch(count, line, "different store".ToString());
+            }
+
+            if this.AllHalted() {
+                break;
+            }
+        }
+
+        WriteLine("FOLLOW OK " + String::FromInteger(count as u64) + " records, " + (if this.cores[0]->halted { "halted" } else { "not halted" }));
+        0
     }
 
     pub fn Emulate(&mut this) {

@@ -1,0 +1,1480 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "Config.vel", "BRAM.vel", "StoreBuffer.vel"]
+
+enum Arbiter { Idle, DataFill, InstructionFill, Walk, Clean }
+enum Walker { Start, Probe, Probed, Request, Wait, Check }
+enum FetchTlb { Idle, Lookup, Second, SecondWait, Walk }
+
+module Memory(
+    clk: in clock,
+    rst: in reset,
+
+    fetch_pc: in u32,
+    fetch_redirect: in bool,
+    fetch_redirect_pc: in u32,
+    fetch_sequential_pc: in u32,
+    fetch_valid: in bool,
+    fetch_hold: in bool,
+    fetch_instruction: out u32,
+    fetch_hit: out bool,
+    fetch_fault: out bool,
+    fetch_busy: out bool,
+
+    data_address: in u32,
+    data_hold: in bool,
+    m1_access: in bool,
+    m1_address: in u32,
+    m1_load: in bool,
+    m1_store: in bool,
+    m1_size: in u2,
+    m1_signed: in bool,
+    m1_load_data: out u32,
+    m2_replay: out bool,
+    m2_wait: out bool,
+    data_fault: out bool,
+    data_busy: out bool,
+    m2_commit: in bool,
+    m2_retry: in bool,
+    store_commit: in bool,
+    store_data: in u32,
+    store_mask: in u4,
+
+    user_mode: in bool,
+    ptbase: in u32,
+    asid: in u4,
+    tlb_flush: in bool,
+    cache_flush: in bool,
+    icache_flush: in bool,
+    trap_taken: in bool,
+
+    io_index: out u8,
+    io_word: in u32,
+    io_access: out reg bool = false,
+    io_address: out reg u32 = 0,
+    io_write_enable: out reg u4 = 0,
+    io_write_data: out reg u32 = 0,
+
+    flash_request: out reg bool = false,
+    flash_address: out reg u24 = 0,
+    flash_data: in u32,
+    flash_ready: in bool,
+
+    sdram_start: out bool,
+    sdram_write: out bool,
+    sdram_length: out u3,
+    sdram_address: out u21,
+    sdram_data: out u32,
+    sdram_dqm: out u4,
+    sdram_ready: in bool,
+    sdram_valid: in bool,
+    sdram_read_data: in u32,
+
+    #[if CORE_COUNT > 1]
+    sdram_request: out bool,
+    #[if CORE_COUNT > 1]
+    flush_all: in bool,
+    #[if CORE_COUNT > 1]
+    locked: out bool,
+    #[if CORE_COUNT > 1]
+    drained: out bool,
+    #[if CORE_COUNT > 1]
+    tx_request: out bool,
+    #[if CORE_COUNT > 1]
+    tx_address: out reg u32 = 0,
+    #[if CORE_COUNT > 1]
+    tx_write_enable: out reg u4 = 0,
+    #[if CORE_COUNT > 1]
+    tx_write_data: out reg u32 = 0,
+    #[if CORE_COUNT > 1]
+    tx_done: in bool,
+    #[if CORE_COUNT > 1]
+    tx_result: in u32,
+    #[if CORE_COUNT > 1]
+    shared_fetch_request: out bool,
+    #[if CORE_COUNT > 1]
+    shared_fetch_grant: in bool,
+    #[if CORE_COUNT > 1]
+    shared_fetch_word: in u32,
+    #[if CORE_COUNT > 1]
+    own_request: out bool,
+    #[if CORE_COUNT > 1]
+    own_line: out reg u18 = 0,
+    #[if CORE_COUNT > 1]
+    own_grant: in bool,
+    #[if CORE_COUNT > 1]
+    snoop_valid: in bool,
+    #[if CORE_COUNT > 1]
+    snoop_line: in u18,
+    #[if CORE_COUNT > 1]
+    snoop_ack: out bool,
+    #[if CORE_COUNT > 1]
+    reservation_kill: out reg bool = false
+) {
+    reg arbiter: Arbiter = Arbiter::Idle;
+    reg walk_state: Walker = Walker::Start;
+    reg itlb_state: FetchTlb = FetchTlb::Idle;
+
+    reg tlb_valid: u8 = 0;
+    reg tlb_asid: [u4; 8];
+    reg tlb_page: [u18; 8];
+    reg tlb_frame: [u11; 8];
+    reg tlb_writable: u8 = 0;
+    reg tlb_executable: u8 = 0;
+    reg tlb_next: u3 = 0;
+
+    reg utlb_valid: u4 = 0;
+    reg utlb_asid: [u4; 4];
+    reg utlb_page: [u18; 4];
+    reg utlb_frame: [u11; 4];
+    reg utlb_executable: u4 = 0;
+    reg utlb_next: u2 = 0;
+
+    reg second_valid: u256 = 0;
+    reg second_entries: [u27; 256];
+    reg second_read: u27;
+    reg second_busy: bool = false;
+    reg second_for_data: bool = false;
+    reg second_present: bool = false;
+    reg second_page: u18 = 0;
+    reg walk_stale: bool = false;
+
+    reg itlb_page: u18 = 0;
+    reg ifault_valid: bool = false;
+    reg ifault_page: u18 = 0;
+
+    reg f_address: u32 = 0;
+    reg f_request: bool = false;
+    reg f_denied: bool = false;
+    reg f_match: bool = false;
+    reg f_executable: bool = false;
+    reg f_bram: bool = false;
+    reg f_window: bool = false;
+    reg f_expected: u11 = 0;
+    reg f_page_fault: bool = false;
+    reg f_collide: bool = false;
+    reg f_held: bool = false;
+    reg held_instruction: u32 = 0;
+    reg held_hit: bool = false;
+    reg held_fault: bool = false;
+
+    reg icache_data0: [u32; 2048];
+    reg icache_data1: [u32; 2048];
+    reg icache_tags0: [u12; 256];
+    reg icache_tags1: [u12; 256];
+    reg icache_read0: u32;
+    reg icache_read1: u32;
+    reg icache_tag0: u12;
+    reg icache_tag1: u12;
+    reg icache_mru: u256 = 0;
+    reg mru_update: bool = false;
+    reg mru_set: u8 = 0;
+    reg mru_way: bool = false;
+    reg icache_ways: [bool; 16384];
+    reg way_read: bool;
+    reg way_fix: bool = false;
+    reg way_fix_index: u14 = 0;
+    reg way_fix_value: bool = false;
+
+    reg iclearing: bool = true;
+    reg iclear_index: u8 = 0;
+    reg ifill_pending: bool = false;
+    reg ifill_fresh: bool = false;
+    reg ifill_frame: u11 = 0;
+    reg ifill_index: u8 = 0;
+    reg ifill_line: u14 = 0;
+    reg ifill_way: bool = false;
+
+    reg way0_lane0: [u8; 1024];
+    reg way0_lane1: [u8; 1024];
+    reg way0_lane2: [u8; 1024];
+    reg way0_lane3: [u8; 1024];
+    reg way1_lane0: [u8; 1024];
+    reg way1_lane1: [u8; 1024];
+    reg way1_lane2: [u8; 1024];
+    reg way1_lane3: [u8; 1024];
+    reg read00: u8;
+    reg read01: u8;
+    reg read02: u8;
+    reg read03: u8;
+    reg read10: u8;
+    reg read11: u8;
+    reg read12: u8;
+    reg read13: u8;
+    reg port00: u8;
+    reg port01: u8;
+    reg port02: u8;
+    reg port03: u8;
+    reg port10: u8;
+    reg port11: u8;
+    reg port12: u8;
+    reg port13: u8;
+    reg dtags0: [u12; 128];
+    reg dtags1: [u12; 128];
+    reg dtag0: u12;
+    reg dtag1: u12;
+    reg port_tag0: u12;
+    reg port_tag1: u12;
+    reg vtags0: [u6; 128];
+    reg vtags1: [u6; 128];
+    reg dirty0: u128 = 0;
+    reg dirty1: u128 = 0;
+    reg dmru: u128 = 0;
+    reg dmru_update: bool = false;
+    reg dmru_set: u7 = 0;
+    reg dmru_way: bool = false;
+
+    reg dclearing: bool = true;
+    reg dclear_index: u7 = 0;
+    reg dfill_pending: bool = false;
+    reg dfill_frame: u11 = 0;
+    reg dfill_index: u7 = 0;
+    reg dfill_vtag: u6 = 0;
+    reg dfill_way: bool = false;
+    reg dfill_victim_dirty: bool = false;
+    reg fill_offset: u3 = 0;
+    reg issued: bool = false;
+
+    reg vtag_fix: bool = false;
+    reg vtag_fix_set: u7 = 0;
+    reg vtag_fix_way: bool = false;
+    reg vtag_fix_value: u6 = 0;
+
+    reg clean_step: u4 = 0;
+    reg clean_set: u7 = 0;
+    reg clean_way: bool = false;
+    reg clean_frame: u11 = 0;
+    reg clean_for_data: bool = false;
+    reg clean_need_reg: bool = false;
+
+    reg walk_data: bool = false;
+    reg walk_leaf: bool = false;
+    reg walk_page: u18 = 0;
+    reg walk_address: u21 = 0;
+    reg walk_entry: u32 = 0;
+
+    reg s_access: bool = false;
+    reg s_address: u32 = 0;
+    reg s_load: bool = false;
+    reg s_store: bool = false;
+    reg s_bram: bool = false;
+    reg s_io: bool = false;
+    reg s_cached: bool = false;
+    reg s_flash: bool = false;
+    reg s_frame: u11 = 0;
+    reg s_fault: bool = false;
+    reg s_tlb_wait: bool = false;
+    reg s_second_done: bool = false;
+    reg s_tag0: u12 = 0;
+    reg s_tag1: u12 = 0;
+    reg s_hit0: bool = false;
+    reg s_hit1: bool = false;
+    reg s_tlb_retry: bool = false;
+    reg vtag_read1: u6 = 0;
+    reg dfill_go: bool = false;
+    reg ifill_go: bool = false;
+    reg ifill_clean_go: bool = false;
+    reg s_predicted: bool = false;
+    reg s_stale: bool = false;
+    reg s_flash_miss: bool = false;
+
+    reg p_valid: bool = false;
+    reg p_bram: bool = false;
+    reg p_hit: bool = false;
+    reg p_way: bool = false;
+    reg p_push: bool = false;
+    reg p_address: u32 = 0;
+    reg p_physical: u21 = 0;
+    reg p_data: u32 = 0;
+    reg p_mask: u4 = 0;
+    reg last_valid: bool = false;
+    reg last_index: u10 = 0;
+    reg bram_skip: bool = false;
+    reg io_last: bool = false;
+    reg store_wait: bool = false;
+
+    reg io_buffer: u32 = 0;
+    reg io_buffer_valid: bool = false;
+    reg io_buffer_address: u32 = 0;
+    reg s_io_miss: bool = false;
+    reg m1_sticky: bool = false;
+    reg flash_busy: bool = false;
+    reg flash_valid: bool = false;
+    reg flash_word: u32 = 0;
+    reg flash_word_address: u22 = 0;
+
+    if CORE_COUNT > 1 {
+        reg tx_pending: bool = false;
+        reg f_granted: bool = false;
+        reg own_busy: bool = false;
+        reg own_kind: u2 = 0;
+        reg clean_snoop: bool = false;
+        reg clean_match: bool = false;
+        reg snoop_flushed: bool = false;
+        reg snoop_done: bool = false;
+        reg served_line: u18 = 0;
+        reg ifill_checked: bool = false;
+        reg drop_last: bool = false;
+        reg drop_set: u7 = 0;
+        wire store_buffered: bool;
+        wire snoop_buffered: bool;
+    }
+
+    wire itlb_hit: bool;
+    wire itlb_frame: u11;
+    wire itlb_executable: bool;
+    wire dtlb_hit: bool;
+    wire dtlb_frame: u11;
+    wire dtlb_writable: bool;
+    wire redirect_match: bool;
+    wire redirect_frame: u11;
+    wire redirect_executable: bool;
+    wire sequential_match: bool;
+    wire sequential_frame: u11;
+    wire sequential_executable: bool;
+    wire window_hit0: bool;
+    wire window_hit1: bool;
+    wire dconflict: bool;
+    wire iconflict: bool;
+    wire aligned: u32;
+    wire sdram_start_value: bool;
+    wire sdram_write_value: bool;
+    wire sdram_length_value: u3;
+    wire sdram_address_value: u21;
+    wire sdram_data_value: u32;
+    wire sdram_dqm_value: u4;
+
+    if CORE_COUNT == 1 {
+        let bram = BRAM {
+            fetch_address: fetch_pc,
+            fetch_hold: false,
+            data_address,
+            data_hold,
+            write: p_valid && p_bram,
+            write_address: p_address,
+            write_data: p_data,
+            write_mask: p_mask
+        };
+    }
+
+    let clean_push = arbiter == Arbiter::Clean && clean_step >= 5 && (CORE_COUNT == 1 || clean_step <= 12);
+    let clean_word = (clean_step - 4)[2:0];
+    let clean_push_word = (clean_step - 5)[2:0];
+    let port_word0 = cat(port03, port02, port01, port00);
+    let port_word1 = cat(port13, port12, port11, port10);
+
+    let buffer = StoreBuffer {
+        push: p_push || clean_push,
+        push_address: if clean_push { cat(clean_frame, clean_set, clean_push_word) } else { p_physical },
+        push_data: if clean_push { (if clean_way { port_word1 } else { port_word0 }) } else { p_data },
+        push_dqm: if clean_push { 0 as u4 } else { !p_mask },
+        pop: drain
+    };
+
+    let drain = arbiter == Arbiter::Idle && !buffer.empty && sdram_ready;
+    let quiet = buffer.empty && !p_valid;
+
+    let fetch_region = fetch_pc[31:30];
+    let f_translated = !f_window || f_match;
+    let f_way = way_read;
+    let f_hit0 = icache_tag0[11] && icache_tag0[10:0] == f_expected;
+    let f_hit1 = icache_tag1[11] && icache_tag1[10:0] == f_expected;
+    let f_tag_hit = (f_hit0 || f_hit1) && !iclearing;
+    let f_way_hit = (if f_way { f_hit1 } else { f_hit0 }) && !iclearing;
+    let icache_word = if f_way { icache_read1 } else { icache_read0 };
+    let live_fault = f_denied || f_page_fault || (f_window && f_match && !f_executable);
+    let live_hit = !live_fault && !f_collide && ((f_bram && (CORE_COUNT == 1 || f_granted)) || (f_translated && f_way_hit));
+    let live_instruction = if f_bram { (if CORE_COUNT > 1 { shared_fetch_word } else { bram.fetch_word }) } else { icache_word };
+    let f_icache_miss = f_request && !f_held && !f_bram && !live_fault && !f_collide && f_translated && !f_tag_hit;
+    let f_itlb_miss = f_request && !f_held && f_window && !live_fault && !f_match;
+
+    let ifill_write = arbiter == Arbiter::InstructionFill && issued && sdram_valid;
+    let ifill_done = ifill_write && fill_offset == 7;
+    let itag_write0 = iclearing || (ifill_done && !ifill_way);
+    let itag_write1 = iclearing || (ifill_done && ifill_way);
+    let itag_index = if iclearing { iclear_index } else { ifill_index };
+    let itag_value: u12 = if iclearing { 0 } else { cat(true, ifill_frame) };
+    let way_write = ifill_done || way_fix;
+    let way_write_index = if ifill_done { ifill_line } else { way_fix_index };
+    let way_write_value = if ifill_done { ifill_way } else { way_fix_value };
+
+    let dfill_write = arbiter == Arbiter::DataFill && issued && sdram_valid;
+    let dfill_done = dfill_write && fill_offset == 7;
+    let p_cache_write = p_valid && p_hit;
+    let coherent_index: u10 = if arbiter == Arbiter::Walk { walk_address[9:0] } else { cat(clean_set, clean_word) };
+    let dport: u10 = if dfill_write { cat(dfill_index, fill_offset) } else if p_cache_write { p_address[11:2] } else { coherent_index };
+    let dport_data = if dfill_write { sdram_read_data } else { p_data };
+    let dport_read = !dfill_write && !p_cache_write;
+    let lanes: u4 = if dfill_write { 0xF } else { p_mask };
+    let way0_write = (dfill_write && !dfill_way) || (p_cache_write && !p_way);
+    let way1_write = (dfill_write && dfill_way) || (p_cache_write && p_way);
+    let write00 = way0_write && lanes[0];
+    let write01 = way0_write && lanes[1];
+    let write02 = way0_write && lanes[2];
+    let write03 = way0_write && lanes[3];
+    let write10 = way1_write && lanes[0];
+    let write11 = way1_write && lanes[1];
+    let write12 = way1_write && lanes[2];
+    let write13 = way1_write && lanes[3];
+    let tport: u7 = if dclearing { dclear_index } else if dfill_done { dfill_index } else { coherent_index[9:3] };
+    let dtag_write0 = dclearing || (dfill_done && !dfill_way) || (CORE_COUNT > 1 && snoop_drop && !clean_way);
+    let dtag_write1 = dclearing || (dfill_done && dfill_way) || (CORE_COUNT > 1 && snoop_drop && clean_way);
+    let dtag_value: u12 = if dclearing || (CORE_COUNT > 1 && snoop_drop) { 0 } else { cat(true, dfill_frame) };
+    let tport_read = !dclearing && !dfill_done && (CORE_COUNT == 1 || !snoop_drop);
+    let vtag_write0 = (dfill_done && !dfill_way) || (vtag_fix && !dfill_done);
+    let vtag_write1 = (dfill_done && dfill_way) || (vtag_fix && !dfill_done);
+    let vtag_set = if dfill_done { dfill_index } else { vtag_fix_set };
+    let vtag_value0: u6 = if dfill_done { dfill_vtag } else if vtag_fix_way { vtag_fix_value ^ 1 } else { vtag_fix_value };
+    let vtag_value1: u6 = if dfill_done { dfill_vtag } else if vtag_fix_way { vtag_fix_value } else { vtag_fix_value ^ 1 };
+
+    let pipeline_index = data_address[11:2];
+    let pipeline_set = data_address[11:5];
+
+    let m1_region = m1_address[31:30];
+    let m1_window = m1_region == 3;
+    let m1_cached = m1_region[0];
+    let m1_text = m1_address[31:14] == 2;
+    let m1_io = m1_region == 0 && (m1_address[31:8] == 0xFF || m1_text);
+    let m1_flash = m1_region == 2;
+    let m1_bram = m1_region == 0 && !m1_io;
+    let m1_frame = if m1_window { dtlb_frame } else { m1_address[22:12] };
+    let m1_predicted = vtag_read1 == m1_address[17:12];
+    let direct_hit0 = dtag0[10:0] == m1_address[22:12];
+    let direct_hit1 = dtag1[10:0] == m1_address[22:12];
+    let m1_hit0 = dtag0[11] && (if m1_window { window_hit0 } else { direct_hit0 });
+    let m1_hit1 = dtag1[11] && (if m1_window { window_hit1 } else { direct_hit1 });
+    let fetch_match = if fetch_redirect { redirect_match } else { sequential_match };
+    let fetch_frame = if fetch_redirect { redirect_frame } else { sequential_frame };
+    let fetch_executable = if fetch_redirect { redirect_executable } else { sequential_executable };
+    let word0 = cat(read03, read02, read01, read00);
+    let word1 = cat(read13, read12, read11, read10);
+    let cached_word = if m1_predicted { word1 } else { word0 };
+    let m1_io_hit = io_buffer_valid && io_buffer_address == m1_address;
+    let m1_io_miss = m1_io && !m1_text && !m1_io_hit;
+    let io_value = if m1_text { 0 as u32 } else { io_buffer };
+    let uncached_word = if CORE_COUNT > 1 { (if m1_flash { flash_word } else { io_value }) } else { (if m1_io { io_value } else if m1_flash { flash_word } else { bram.data_word }) };
+    let raw_word = if m1_cached { cached_word } else { uncached_word };
+    let shifted = raw_word >> cat(m1_address[1:0], 0 as u3);
+    let m1_index = m1_address[11:2];
+    let m1_conflict = (store_commit && s_address[11:2] == m1_index) || (p_valid && (p_bram || p_hit) && p_address[11:2] == m1_index) ||
+        (last_valid && last_index == m1_index) || (m1_bram && bram_skip) || (m1_io && ((s_access && s_io) || io_access || io_last)) ||
+        (CORE_COUNT > 1 && ((snoop_drop && m1_address[11:5] == clean_set) || (drop_last && m1_address[11:5] == drop_set)));
+    let m1_flash_miss = m1_flash && !(flash_valid && flash_word_address == m1_address[23:2]);
+
+    let hit0 = s_hit0 && !dclearing;
+    let hit1 = s_hit1 && !dclearing;
+    let s_hit = hit0 || hit1;
+    let s_way_wrong = s_hit && hit1 != s_predicted;
+    let s_set = s_address[11:5];
+    let s_physical = cat(s_frame, s_address[11:2]);
+    let s_victim = s_tag0[11] && (!s_tag1[11] || !dmru[s_set]);
+    let s_victim_dirty = (if s_victim { s_tag1[11] && dirty1[s_set] } else { s_tag0[11] && dirty0[s_set] }) ||
+        (p_valid && p_hit && p_way == s_victim && p_address[11:5] == s_set);
+
+    let ifill_set = ifill_index[6:0];
+    let ifill_clean = !dirty0[ifill_set] && !dirty1[ifill_set] && !(p_valid && p_hit && p_address[11:5] == ifill_set);
+    let dfill_ready = dfill_pending && !dconflict && !dclearing;
+    let ifill_ready = ifill_pending && !iconflict && !iclearing && !ifill_fresh;
+    let data_walk = s_access && s_tlb_wait && s_second_done;
+    let fetch_walk = itlb_state == FetchTlb::Walk;
+    let walk_finish = arbiter == Arbiter::Walk && walk_state == Walker::Check && (!walk_entry[0] || walk_leaf);
+    let walk_success = walk_entry[0];
+    let clean_need0 = port_tag0[11] && dirty0[clean_set] && (clean_for_data || port_tag0[10:0] == ifill_frame);
+    let clean_need1 = port_tag1[11] && dirty1[clean_set] && (clean_for_data || port_tag1[10:0] == ifill_frame);
+    let clean_need = if clean_for_data { dfill_victim_dirty } else { clean_need0 || clean_need1 };
+    let clean_choice = if clean_for_data { dfill_way } else { clean_need1 };
+
+    let second_data_request = s_access && s_tlb_wait && !s_second_done && !second_busy;
+    let second_fetch_request = itlb_state == FetchTlb::Second && !second_busy && !second_data_request;
+    let second_lookup = if second_data_request { s_address[29:12] } else { itlb_page };
+    let second_write = walk_finish && walk_success && !walk_stale;
+    let second_hit = second_present && second_read[26:17] == second_page[17:8] && second_read[16:13] == asid;
+    let second_install = second_busy && second_hit && !second_write;
+
+    fetch_fault = if f_held { held_fault } else { live_fault };
+    fetch_hit = if f_held { held_hit } else { live_hit };
+    fetch_instruction = if f_held { held_instruction } else { live_instruction };
+    fetch_busy = ifill_pending || arbiter == Arbiter::InstructionFill || iclearing || itlb_state != FetchTlb::Idle || icache_flush || cache_flush || tlb_flush || (CORE_COUNT > 1 && flush_all);
+    data_busy = dfill_pending || arbiter == Arbiter::DataFill || dclearing || flash_busy || (CORE_COUNT > 1 && tx_pending);
+    m2_replay = s_access && !s_fault && (s_stale || s_flash_miss || s_io_miss || s_tlb_retry || (s_cached && s_load && (!s_hit || s_way_wrong)));
+    m2_wait = s_access && (s_tlb_wait || (s_store && s_cached && store_wait) || (CORE_COUNT > 1 && store_miss && !store_owned));
+    data_fault = s_access && s_fault;
+    m1_load_data = aligned;
+    io_index = s_address[7:0];
+    sdram_start = sdram_start_value;
+    sdram_write = sdram_write_value;
+    sdram_length = sdram_length_value;
+    sdram_address = sdram_address_value;
+    sdram_data = sdram_data_value;
+    sdram_dqm = sdram_dqm_value;
+
+    if CORE_COUNT > 1 {
+        let m1_tx_miss = m1_region == 0 && !m1_io_hit;
+        let data_owned = own_busy && own_grant && own_kind == 0;
+        let inst_owned = own_busy && own_grant && own_kind == 1;
+        let walk_owned = own_busy && own_grant && own_kind == 2;
+        let store_line = s_physical[20:3];
+        let store_miss = s_access && s_store && s_cached && !s_hit && !s_fault && !s_stale && !s_tlb_wait && !s_tlb_retry;
+        let store_owned = (own_busy && own_grant && own_kind == 3 && own_line == store_line) || (store_buffered && !(snoop_valid && snoop_line == store_line));
+        let snoop_pending = snoop_valid && !snoop_done && !snoop_flushed && !dclearing;
+        let snoop_drop = arbiter == Arbiter::Clean && clean_snoop && clean_step == 13 && clean_match;
+        let snoop_frame = served_line[17:7];
+        let snoop_match0 = port_tag0[11] && port_tag0[10:0] == snoop_frame;
+        let snoop_match1 = port_tag1[11] && port_tag1[10:0] == snoop_frame;
+        sdram_request = (arbiter == Arbiter::Idle && !buffer.empty) || ((arbiter == Arbiter::DataFill || arbiter == Arbiter::InstructionFill) && !issued) ||
+            (arbiter == Arbiter::Walk && walk_state == Walker::Request && walk_owned);
+        own_request = own_busy;
+        snoop_ack = snoop_done && served_line == snoop_line;
+        locked = tx_pending || io_buffer_valid;
+        drained = quiet;
+        tx_request = tx_pending && quiet;
+        shared_fetch_request = fetch_valid && !fetch_region[0];
+    }
+
+    comb {
+        aligned = shifted;
+
+        match m1_size {
+            0 => aligned = cat(rep(24, m1_signed && shifted[7]), shifted[7:0]),
+            1 => aligned = cat(rep(16, m1_signed && shifted[15]), shifted[15:0]),
+            _ => {}
+        }
+    }
+
+    comb {
+        itlb_hit = false;
+        itlb_frame = 0;
+        itlb_executable = false;
+        dtlb_hit = false;
+        dtlb_frame = 0;
+        dtlb_writable = false;
+
+        for i in 0..8 {
+            if tlb_valid[i] && tlb_asid[i] == asid && tlb_page[i] == itlb_page {
+                itlb_hit = true;
+                itlb_frame = itlb_frame | tlb_frame[i];
+                itlb_executable = itlb_executable || tlb_executable[i];
+            }
+
+            if tlb_valid[i] && tlb_asid[i] == asid && tlb_page[i] == m1_address[29:12] {
+                dtlb_hit = true;
+                dtlb_frame = dtlb_frame | tlb_frame[i];
+                dtlb_writable = dtlb_writable || tlb_writable[i];
+            }
+        }
+    }
+
+    comb {
+        redirect_match = false;
+        redirect_frame = 0;
+        redirect_executable = false;
+        sequential_match = false;
+        sequential_frame = 0;
+        sequential_executable = false;
+
+        for i in 0..4 {
+            if utlb_valid[i] && utlb_asid[i] == asid && utlb_page[i] == fetch_redirect_pc[29:12] {
+                redirect_match = true;
+                redirect_frame = redirect_frame | utlb_frame[i];
+                redirect_executable = redirect_executable || utlb_executable[i];
+            }
+
+            if utlb_valid[i] && utlb_asid[i] == asid && utlb_page[i] == fetch_sequential_pc[29:12] {
+                sequential_match = true;
+                sequential_frame = sequential_frame | utlb_frame[i];
+                sequential_executable = sequential_executable || utlb_executable[i];
+            }
+        }
+    }
+
+    comb {
+        window_hit0 = false;
+        window_hit1 = false;
+
+        for i in 0..8 {
+            if tlb_valid[i] && tlb_asid[i] == asid && tlb_page[i] == m1_address[29:12] {
+                if tlb_frame[i] == dtag0[10:0] {
+                    window_hit0 = true;
+                }
+
+                if tlb_frame[i] == dtag1[10:0] {
+                    window_hit1 = true;
+                }
+            }
+        }
+    }
+
+    if CORE_COUNT > 1 {
+        comb {
+            store_buffered = p_push && p_physical[20:3] == store_line;
+            snoop_buffered = p_push && p_physical[20:3] == served_line;
+
+            for i in 0..8 {
+                if buffer.valid[i] && buffer.lines[i * 18 + 17:i * 18] == store_line {
+                    store_buffered = true;
+                }
+
+                if buffer.valid[i] && buffer.lines[i * 18 + 17:i * 18] == served_line {
+                    snoop_buffered = true;
+                }
+            }
+        }
+    }
+
+    comb {
+        dconflict = p_push && p_physical[20:3] == cat(dfill_frame, dfill_index);
+        iconflict = p_push && p_physical[20:3] == cat(ifill_frame, ifill_set);
+
+        for i in 0..8 {
+            if buffer.valid[i] && buffer.lines[i * 18 + 17:i * 18] == cat(dfill_frame, dfill_index) {
+                dconflict = true;
+            }
+
+            if buffer.valid[i] && buffer.lines[i * 18 + 17:i * 18] == cat(ifill_frame, ifill_set) {
+                iconflict = true;
+            }
+        }
+    }
+
+    comb {
+        sdram_start_value = false;
+        sdram_write_value = false;
+        sdram_length_value = 0;
+        sdram_address_value = buffer.head_address;
+        sdram_data_value = buffer.head_data;
+        sdram_dqm_value = 0;
+
+        match arbiter {
+            Arbiter::Idle => {
+                sdram_start_value = drain;
+                sdram_write_value = true;
+                sdram_dqm_value = buffer.head_dqm;
+            },
+            Arbiter::DataFill => {
+                sdram_start_value = !issued && sdram_ready;
+                sdram_length_value = 7;
+                sdram_address_value = cat(dfill_frame, dfill_index, 0 as u3);
+            },
+            Arbiter::InstructionFill => {
+                sdram_start_value = !issued && sdram_ready;
+                sdram_length_value = 7;
+                sdram_address_value = cat(ifill_frame, ifill_set, 0 as u3);
+            },
+            Arbiter::Walk => {
+                sdram_start_value = walk_state == Walker::Request && sdram_ready && (CORE_COUNT == 1 || walk_owned);
+                sdram_address_value = walk_address;
+            },
+            _ => {}
+        }
+    }
+
+    seq(clk) {
+        if ifill_write && !ifill_way {
+            icache_data0[cat(ifill_index, fill_offset)] <- sdram_read_data;
+        }
+
+        icache_read0 <- icache_data0[fetch_pc[12:2]];
+    }
+
+    seq(clk) {
+        if ifill_write && ifill_way {
+            icache_data1[cat(ifill_index, fill_offset)] <- sdram_read_data;
+        }
+
+        icache_read1 <- icache_data1[fetch_pc[12:2]];
+    }
+
+    seq(clk) {
+        if way_write {
+            icache_ways[way_write_index] <- way_write_value;
+        }
+
+        way_read <- icache_ways[fetch_pc[18:5]];
+    }
+
+    seq(clk) {
+        if itag_write0 {
+            icache_tags0[itag_index] <- itag_value;
+        }
+
+        icache_tag0 <- icache_tags0[fetch_pc[12:5]];
+    }
+
+    seq(clk) {
+        if itag_write1 {
+            icache_tags1[itag_index] <- itag_value;
+        }
+
+        icache_tag1 <- icache_tags1[fetch_pc[12:5]];
+    }
+
+    seq(clk) {
+        if second_write {
+            second_entries[walk_page[7:0]] <- cat(walk_page[17:8], asid, walk_entry[22:12], walk_entry[1], walk_entry[2]);
+        }
+
+        second_read <- second_entries[second_lookup[7:0]];
+    }
+
+    seq(clk) {
+        if !data_hold {
+            read00 <- way0_lane0[pipeline_index];
+        }
+    }
+
+    seq(clk) {
+        if !data_hold {
+            read01 <- way0_lane1[pipeline_index];
+        }
+    }
+
+    seq(clk) {
+        if !data_hold {
+            read02 <- way0_lane2[pipeline_index];
+        }
+    }
+
+    seq(clk) {
+        if !data_hold {
+            read03 <- way0_lane3[pipeline_index];
+        }
+    }
+
+    seq(clk) {
+        if !data_hold {
+            read10 <- way1_lane0[pipeline_index];
+        }
+    }
+
+    seq(clk) {
+        if !data_hold {
+            read11 <- way1_lane1[pipeline_index];
+        }
+    }
+
+    seq(clk) {
+        if !data_hold {
+            read12 <- way1_lane2[pipeline_index];
+        }
+    }
+
+    seq(clk) {
+        if !data_hold {
+            read13 <- way1_lane3[pipeline_index];
+        }
+    }
+
+    seq(clk) {
+        if write00 || dport_read {
+            if write00 {
+                way0_lane0[dport] <- dport_data[7:0];
+            } else {
+                port00 <- way0_lane0[dport];
+            }
+        }
+    }
+
+    seq(clk) {
+        if write01 || dport_read {
+            if write01 {
+                way0_lane1[dport] <- dport_data[15:8];
+            } else {
+                port01 <- way0_lane1[dport];
+            }
+        }
+    }
+
+    seq(clk) {
+        if write02 || dport_read {
+            if write02 {
+                way0_lane2[dport] <- dport_data[23:16];
+            } else {
+                port02 <- way0_lane2[dport];
+            }
+        }
+    }
+
+    seq(clk) {
+        if write03 || dport_read {
+            if write03 {
+                way0_lane3[dport] <- dport_data[31:24];
+            } else {
+                port03 <- way0_lane3[dport];
+            }
+        }
+    }
+
+    seq(clk) {
+        if write10 || dport_read {
+            if write10 {
+                way1_lane0[dport] <- dport_data[7:0];
+            } else {
+                port10 <- way1_lane0[dport];
+            }
+        }
+    }
+
+    seq(clk) {
+        if write11 || dport_read {
+            if write11 {
+                way1_lane1[dport] <- dport_data[15:8];
+            } else {
+                port11 <- way1_lane1[dport];
+            }
+        }
+    }
+
+    seq(clk) {
+        if write12 || dport_read {
+            if write12 {
+                way1_lane2[dport] <- dport_data[23:16];
+            } else {
+                port12 <- way1_lane2[dport];
+            }
+        }
+    }
+
+    seq(clk) {
+        if write13 || dport_read {
+            if write13 {
+                way1_lane3[dport] <- dport_data[31:24];
+            } else {
+                port13 <- way1_lane3[dport];
+            }
+        }
+    }
+
+    seq(clk) {
+        if !data_hold {
+            dtag0 <- dtags0[pipeline_set];
+        }
+    }
+
+    seq(clk) {
+        if !data_hold {
+            dtag1 <- dtags1[pipeline_set];
+        }
+    }
+
+    seq(clk) {
+        if dtag_write0 || tport_read {
+            if dtag_write0 {
+                dtags0[tport] <- dtag_value;
+            } else {
+                port_tag0 <- dtags0[tport];
+            }
+        }
+    }
+
+    seq(clk) {
+        if dtag_write1 || tport_read {
+            if dtag_write1 {
+                dtags1[tport] <- dtag_value;
+            } else {
+                port_tag1 <- dtags1[tport];
+            }
+        }
+    }
+
+    seq(clk) {
+        if vtag_write0 {
+            vtags0[vtag_set] <- vtag_value0;
+        }
+    }
+
+    seq(clk) {
+        if vtag_write1 {
+            vtags1[vtag_set] <- vtag_value1;
+        }
+    }
+
+    seq(clk) {
+        if !data_hold {
+            vtag_read1 <- vtags1[pipeline_set];
+        }
+    }
+
+    seq {
+        io_access <- m2_commit && s_io;
+        io_address <- s_address;
+        io_write_enable <- if s_store { store_mask } else { 0 };
+        io_write_data <- store_data;
+        io_last <- io_access;
+
+        if CORE_COUNT > 1 {
+            if tx_done {
+                io_buffer <- tx_result;
+                io_buffer_address <- tx_address;
+                io_buffer_valid <- true;
+                tx_pending <- false;
+            } else if m2_commit && (s_io || s_bram) {
+                io_buffer_valid <- false;
+            }
+
+            if m2_retry && s_io_miss && !tx_pending && !io_buffer_valid {
+                tx_pending <- true;
+                tx_address <- s_address;
+                tx_write_enable <- if s_store { store_mask } else { 0 };
+                tx_write_data <- store_data;
+            }
+        } else if m2_retry && s_io_miss && !io_access {
+            io_buffer <- io_word;
+            io_buffer_address <- s_address;
+            io_buffer_valid <- true;
+        } else if (m2_commit && s_io && s_load) || (io_access && io_write_enable != 0) {
+            io_buffer_valid <- false;
+        }
+
+        if !fetch_hold {
+            f_held <- false;
+            f_address <- fetch_pc;
+            f_request <- fetch_valid;
+            f_denied <- user_mode && fetch_region != 3;
+            f_match <- fetch_match;
+            f_executable <- fetch_executable;
+            f_bram <- !fetch_region[0];
+
+            if CORE_COUNT > 1 {
+                f_granted <- shared_fetch_grant;
+            }
+            f_window <- fetch_region == 3;
+            f_expected <- if fetch_region == 3 { fetch_frame } else { fetch_pc[22:12] };
+            f_page_fault <- fetch_region == 3 && ifault_valid && ifault_page == fetch_pc[29:12];
+            f_collide <- (ifill_write && fetch_pc[12:5] == ifill_index) || ((itag_write0 || itag_write1) && fetch_pc[12:5] == itag_index) ||
+                (p_valid && p_bram && fetch_pc[13:2] == p_address[13:2]);
+        } else if !f_held {
+            f_held <- true;
+            held_instruction <- live_instruction;
+            held_hit <- live_hit;
+            held_fault <- live_fault;
+        }
+
+        if iclearing {
+            iclear_index <- iclear_index + 1;
+
+            if iclear_index == 0xFF {
+                iclearing <- false;
+            }
+        }
+
+        if cache_flush || icache_flush || (CORE_COUNT > 1 && flush_all) {
+            iclearing <- true;
+            iclear_index <- 0;
+        }
+
+        if dclearing {
+            dclear_index <- dclear_index + 1;
+            dirty0[dclear_index] <- false;
+            dirty1[dclear_index] <- false;
+
+            if dclear_index == 0x7F {
+                dclearing <- false;
+            }
+        }
+
+        ifill_fresh <- false;
+
+        if f_icache_miss && !ifill_pending && arbiter != Arbiter::InstructionFill && !iclearing {
+            ifill_pending <- true;
+            ifill_fresh <- true;
+            ifill_frame <- f_expected;
+            ifill_index <- f_address[12:5];
+            ifill_line <- f_address[18:5];
+            ifill_way <- icache_tag0[11] && (!icache_tag1[11] || !icache_mru[f_address[12:5]]);
+        }
+
+        way_fix <- f_request && !f_held && !f_bram && f_tag_hit && !f_way_hit;
+        way_fix_index <- f_address[18:5];
+        way_fix_value <- f_hit1;
+        mru_update <- f_request && !f_held && !f_bram && f_tag_hit;
+        mru_set <- f_address[12:5];
+        mru_way <- f_hit1;
+
+        if mru_update {
+            icache_mru[mru_set] <- mru_way;
+        }
+
+        if ifill_done {
+            icache_mru[ifill_index] <- ifill_way;
+        }
+
+        dmru_update <- m2_commit && s_cached && s_hit;
+        dmru_set <- s_set;
+        dmru_way <- hit1;
+
+        if dmru_update {
+            dmru[dmru_set] <- dmru_way;
+        }
+
+        if dfill_done {
+            dmru[dfill_index] <- dfill_way;
+        }
+
+        if f_itlb_miss && itlb_state == FetchTlb::Idle {
+            itlb_page <- f_address[29:12];
+            itlb_state <- FetchTlb::Lookup;
+        }
+
+        if itlb_state == FetchTlb::Lookup {
+            if itlb_hit {
+                utlb_valid[utlb_next] <- true;
+                utlb_asid[utlb_next] <- asid;
+                utlb_page[utlb_next] <- itlb_page;
+                utlb_frame[utlb_next] <- itlb_frame;
+                utlb_executable[utlb_next] <- itlb_executable;
+                utlb_next <- utlb_next + 1;
+                itlb_state <- FetchTlb::Idle;
+            } else {
+                itlb_state <- FetchTlb::Second;
+            }
+        }
+
+        if second_data_request || second_fetch_request {
+            second_busy <- true;
+            second_for_data <- second_data_request;
+            second_page <- second_lookup;
+            second_present <- second_valid[second_lookup[7:0]] && !(second_write && walk_page[7:0] == second_lookup[7:0]);
+
+            if second_fetch_request {
+                itlb_state <- FetchTlb::SecondWait;
+            }
+        }
+
+        if second_busy {
+            second_busy <- false;
+
+            if second_for_data {
+                if second_hit {
+                    s_tlb_wait <- false;
+                    s_tlb_retry <- true;
+                    s_frame <- second_read[12:2];
+                    s_fault <- s_store && !second_read[1];
+                } else {
+                    s_second_done <- true;
+                }
+            } else if second_hit {
+                utlb_valid[utlb_next] <- true;
+                utlb_asid[utlb_next] <- asid;
+                utlb_page[utlb_next] <- second_page;
+                utlb_frame[utlb_next] <- second_read[12:2];
+                utlb_executable[utlb_next] <- second_read[0];
+                utlb_next <- utlb_next + 1;
+                itlb_state <- FetchTlb::Idle;
+            } else {
+                itlb_state <- FetchTlb::Walk;
+            }
+        }
+
+        if second_install {
+            tlb_valid[tlb_next] <- true;
+            tlb_asid[tlb_next] <- asid;
+            tlb_page[tlb_next] <- second_page;
+            tlb_frame[tlb_next] <- second_read[12:2];
+            tlb_writable[tlb_next] <- second_read[1];
+            tlb_executable[tlb_next] <- second_read[0];
+            tlb_next <- tlb_next + 1;
+        }
+
+        if m2_retry && s_cached && s_load && !s_hit && !s_stale && !s_tlb_retry && !dfill_pending {
+            dfill_pending <- true;
+            dfill_frame <- s_frame;
+            dfill_index <- s_set;
+            dfill_vtag <- s_address[17:12];
+            dfill_way <- s_victim;
+            dfill_victim_dirty <- s_victim_dirty;
+        }
+
+        vtag_fix <- m2_retry && s_cached && s_load && s_way_wrong && !s_stale && !s_tlb_retry;
+        vtag_fix_set <- s_set;
+        vtag_fix_way <- hit1;
+        vtag_fix_value <- s_address[17:12];
+
+        flash_request <- false;
+
+        if m2_retry && s_flash_miss && !flash_busy {
+            flash_request <- true;
+            flash_address <- cat(s_address[23:2], 0 as u2);
+            flash_word_address <- s_address[23:2];
+            flash_busy <- true;
+            flash_valid <- false;
+        } else if flash_busy && flash_ready {
+            flash_word <- flash_data;
+            flash_valid <- true;
+            flash_busy <- false;
+        }
+
+        p_valid <- false;
+        p_bram <- false;
+        p_hit <- false;
+        p_push <- false;
+        store_wait <- (buffer.count as u5) + (p_push as u5) + ((store_commit && s_cached) as u5) >= 8 || arbiter == Arbiter::Clean;
+        last_valid <- p_valid && (p_bram || p_hit);
+        last_index <- p_address[11:2];
+
+        if !data_hold {
+            bram_skip <- p_valid && p_bram;
+            m1_sticky <- false;
+        } else {
+            m1_sticky <- m1_sticky || m1_conflict;
+        }
+
+        if p_valid && p_hit {
+            if p_way {
+                dirty1[p_address[11:5]] <- true;
+            } else {
+                dirty0[p_address[11:5]] <- true;
+            }
+        }
+
+        if dfill_done {
+            if dfill_way {
+                dirty1[dfill_index] <- false;
+            } else {
+                dirty0[dfill_index] <- false;
+            }
+        }
+
+        p_way <- hit1;
+        p_address <- s_address;
+        p_physical <- s_physical;
+        p_data <- store_data;
+        p_mask <- store_mask;
+
+        if store_commit && !s_io && !s_flash && (CORE_COUNT == 1 || !s_bram) {
+            p_valid <- true;
+            p_bram <- s_bram;
+            p_hit <- s_cached && s_hit;
+            p_push <- s_cached && !s_hit;
+        }
+
+        dfill_go <- dfill_ready;
+        ifill_go <- ifill_ready;
+        ifill_clean_go <- ifill_clean;
+
+        match arbiter {
+            Arbiter::Idle => {
+                issued <- false;
+                fill_offset <- 0;
+
+                if CORE_COUNT > 1 && snoop_pending {
+                    clean_step <- 0;
+                    clean_set <- snoop_line[6:0];
+                    clean_for_data <- false;
+                    clean_snoop <- true;
+                    served_line <- snoop_line;
+                    arbiter <- Arbiter::Clean;
+                } else if dfill_go && dfill_pending && !dfill_victim_dirty && (CORE_COUNT == 1 || data_owned) {
+                    dfill_pending <- false;
+                    arbiter <- Arbiter::DataFill;
+                } else if dfill_go && dfill_pending && (CORE_COUNT == 1 || dfill_victim_dirty) {
+                    clean_step <- 0;
+                    clean_set <- dfill_index;
+                    clean_for_data <- true;
+                    arbiter <- Arbiter::Clean;
+                } else if (data_walk || fetch_walk) && quiet && (CORE_COUNT == 1 || !dfill_pending) {
+                    walk_data <- data_walk;
+                    walk_stale <- false;
+                    walk_state <- Walker::Start;
+                    arbiter <- Arbiter::Walk;
+                } else if ifill_go && ifill_pending && !p_push && (ifill_clean_go || (CORE_COUNT > 1 && ifill_checked)) && !p_valid && (CORE_COUNT == 1 || inst_owned) {
+                    ifill_pending <- false;
+                    arbiter <- Arbiter::InstructionFill;
+
+                    if CORE_COUNT > 1 {
+                        ifill_checked <- false;
+                    }
+                } else if ifill_go && ifill_pending && !p_push && !ifill_clean_go && (CORE_COUNT == 1 || !ifill_checked) {
+                    clean_step <- 0;
+                    clean_set <- ifill_set;
+                    clean_for_data <- false;
+                    arbiter <- Arbiter::Clean;
+                }
+            },
+            Arbiter::Clean => {
+                if clean_step == 0 {
+                    if !p_valid {
+                        clean_step <- 1;
+                    }
+                } else if clean_step == 1 {
+                    clean_step <- 2;
+                } else if clean_step == 2 {
+                    if CORE_COUNT > 1 && clean_snoop {
+                        clean_way <- snoop_match1;
+                        clean_frame <- snoop_frame;
+                        clean_need_reg <- (snoop_match0 && dirty0[clean_set]) || (snoop_match1 && dirty1[clean_set]);
+                        clean_match <- snoop_match0 || snoop_match1;
+                    } else {
+                        clean_way <- clean_choice;
+                        clean_frame <- if clean_choice { port_tag1[10:0] } else { port_tag0[10:0] };
+                        clean_need_reg <- clean_need;
+                    }
+
+                    clean_step <- 3;
+                } else if clean_step == 3 {
+                    if !clean_need_reg {
+                        if CORE_COUNT > 1 {
+                            if clean_snoop {
+                                clean_step <- 13;
+                            } else {
+                                if !clean_for_data {
+                                    ifill_checked <- true;
+                                }
+
+                                clean_step <- 0;
+                                arbiter <- Arbiter::Idle;
+                            }
+                        } else if clean_for_data {
+                            dfill_pending <- false;
+                            arbiter <- Arbiter::DataFill;
+                        } else {
+                            ifill_pending <- false;
+                            arbiter <- Arbiter::InstructionFill;
+                        }
+                    } else if !buffer.empty || p_valid {
+                        clean_step <- 0;
+                        arbiter <- Arbiter::Idle;
+
+                        if CORE_COUNT > 1 {
+                            clean_snoop <- false;
+                        }
+                    } else {
+                        clean_step <- 4;
+
+                        if clean_way {
+                            dirty1[clean_set] <- false;
+                        } else {
+                            dirty0[clean_set] <- false;
+                        }
+
+                        if clean_for_data {
+                            dfill_victim_dirty <- false;
+                        }
+                    }
+                } else if clean_step == 12 {
+                    if CORE_COUNT > 1 && clean_snoop {
+                        clean_step <- 13;
+                    } else {
+                        clean_step <- 0;
+                        arbiter <- Arbiter::Idle;
+                    }
+                } else if CORE_COUNT > 1 && clean_step == 13 {
+                    clean_step <- 0;
+                    clean_snoop <- false;
+                    snoop_flushed <- true;
+                    arbiter <- Arbiter::Idle;
+                } else {
+                    clean_step <- clean_step + 1;
+                }
+            },
+            Arbiter::DataFill | Arbiter::InstructionFill => {
+                if sdram_start_value {
+                    issued <- true;
+                }
+
+                if issued && sdram_valid {
+                    fill_offset <- fill_offset + 1;
+
+                    if fill_offset == 7 {
+                        arbiter <- Arbiter::Idle;
+                    }
+                }
+            },
+            Arbiter::Walk => {
+                match walk_state {
+                    Walker::Start => {
+                        walk_leaf <- false;
+                        walk_page <- if walk_data { s_address[29:12] } else { itlb_page };
+                        walk_address <- cat(ptbase[22:10], if walk_data { s_address[29:22] } else { itlb_page[17:10] });
+
+                        if ptbase[0] {
+                            walk_state <- Walker::Probe;
+                        } else {
+                            walk_entry <- 0;
+                            walk_state <- Walker::Check;
+                        }
+                    },
+                    Walker::Probe => {
+                        if !p_valid {
+                            walk_state <- Walker::Probed;
+                        }
+                    },
+                    Walker::Probed => {
+                        if port_tag0[11] && port_tag0[10:0] == walk_address[20:10] {
+                            walk_entry <- port_word0;
+                            walk_state <- Walker::Check;
+                        } else if port_tag1[11] && port_tag1[10:0] == walk_address[20:10] {
+                            walk_entry <- port_word1;
+                            walk_state <- Walker::Check;
+                        } else {
+                            walk_state <- Walker::Request;
+                        }
+                    },
+                    Walker::Request => {
+                        if sdram_ready && (CORE_COUNT == 1 || walk_owned) {
+                            walk_state <- Walker::Wait;
+                        }
+                    },
+                    Walker::Wait => {
+                        if sdram_valid {
+                            walk_entry <- sdram_read_data;
+                            walk_state <- Walker::Check;
+                        }
+                    },
+                    Walker::Check => {
+                        if walk_entry[0] && !walk_leaf {
+                            walk_leaf <- true;
+                            walk_address <- cat(walk_entry[22:12], walk_page[9:0]);
+                            walk_state <- Walker::Probe;
+                        } else {
+                            walk_state <- Walker::Start;
+                            arbiter <- Arbiter::Idle;
+                        }
+                    }
+                }
+
+                if CORE_COUNT > 1 {
+                    if snoop_pending && !walk_owned && (walk_state == Walker::Probe || walk_state == Walker::Probed || walk_state == Walker::Request) {
+                        walk_state <- Walker::Start;
+                        arbiter <- Arbiter::Idle;
+                    }
+                }
+            }
+        }
+
+        if second_write {
+            second_valid[walk_page[7:0]] <- true;
+            tlb_valid[tlb_next] <- true;
+            tlb_asid[tlb_next] <- asid;
+            tlb_page[tlb_next] <- walk_page;
+            tlb_frame[tlb_next] <- walk_entry[22:12];
+            tlb_writable[tlb_next] <- walk_entry[1];
+            tlb_executable[tlb_next] <- walk_entry[2];
+            tlb_next <- tlb_next + 1;
+        }
+
+        if walk_finish && walk_data {
+            s_tlb_wait <- false;
+            s_tlb_retry <- true;
+            s_frame <- walk_entry[22:12];
+            s_fault <- !walk_success || (s_store && !walk_entry[1]);
+        }
+
+        if walk_finish && !walk_data && !walk_stale {
+            itlb_state <- FetchTlb::Idle;
+
+            if walk_success {
+                utlb_valid[utlb_next] <- true;
+                utlb_asid[utlb_next] <- asid;
+                utlb_page[utlb_next] <- walk_page;
+                utlb_frame[utlb_next] <- walk_entry[22:12];
+                utlb_executable[utlb_next] <- walk_entry[2];
+                utlb_next <- utlb_next + 1;
+            } else {
+                ifault_valid <- true;
+                ifault_page <- walk_page;
+            }
+        }
+
+        if !data_hold {
+            s_access <- m1_access;
+            s_address <- m1_address;
+            s_load <- m1_load;
+            s_store <- m1_store;
+            s_bram <- m1_bram;
+            s_io <- m1_io;
+            s_cached <- m1_cached;
+            s_flash <- m1_flash;
+            s_frame <- m1_frame;
+            s_fault <- (m1_window && dtlb_hit && m1_store && !dtlb_writable) || (CORE_COUNT > 1 && m1_access && m1_load && m1_store && m1_region == 0);
+            s_tlb_wait <- m1_access && m1_window && !dtlb_hit;
+            s_second_done <- false;
+            s_tag0 <- dtag0;
+            s_tag1 <- dtag1;
+            s_hit0 <- m1_hit0;
+            s_hit1 <- m1_hit1;
+            s_tlb_retry <- false;
+            s_predicted <- m1_predicted;
+            s_stale <- m1_access && (m1_conflict || m1_sticky);
+            s_flash_miss <- m1_access && m1_load && m1_flash_miss;
+            s_io_miss <- if CORE_COUNT > 1 { m1_access && m1_tx_miss } else { m1_access && m1_load && m1_io_miss };
+        }
+
+        if CORE_COUNT > 1 {
+            drop_last <- snoop_drop;
+            drop_set <- clean_set;
+            reservation_kill <- snoop_drop || dfill_done;
+
+            if snoop_drop && data_hold && s_access && s_set == clean_set {
+                s_stale <- true;
+            }
+
+            if snoop_flushed && !snoop_buffered {
+                snoop_done <- true;
+                snoop_flushed <- false;
+            }
+
+            if snoop_valid && !snoop_done && dclearing {
+                snoop_done <- true;
+                served_line <- snoop_line;
+            }
+
+            if !snoop_valid {
+                snoop_done <- false;
+            }
+
+            if !own_busy {
+                if arbiter == Arbiter::Idle && dfill_go && dfill_pending && !dfill_victim_dirty && !snoop_pending {
+                    own_busy <- true;
+                    own_kind <- 0;
+                    own_line <- cat(dfill_frame, dfill_index);
+                } else if arbiter == Arbiter::Walk && walk_state == Walker::Request && !snoop_pending {
+                    own_busy <- true;
+                    own_kind <- 2;
+                    own_line <- walk_address[20:3];
+                } else if arbiter == Arbiter::Idle && ifill_go && ifill_pending && !p_push && (ifill_clean_go || ifill_checked) && !p_valid && !dfill_pending && !snoop_pending {
+                    own_busy <- true;
+                    own_kind <- 1;
+                    own_line <- cat(ifill_frame, ifill_set);
+                } else if store_miss && !store_owned {
+                    own_busy <- true;
+                    own_kind <- 3;
+                    own_line <- store_line;
+                }
+            } else if (own_kind == 0 && dfill_done) || (own_kind == 1 && ifill_done) ||
+                (own_kind == 2 && !(arbiter == Arbiter::Walk && (walk_state == Walker::Request || (walk_state == Walker::Wait && !sdram_valid)))) ||
+                (own_kind == 3 && (p_push || !store_miss)) {
+                own_busy <- false;
+            }
+        }
+
+        if tlb_flush {
+            tlb_valid <- 0;
+            utlb_valid <- 0;
+            second_valid <- 0;
+            second_busy <- false;
+            itlb_state <- FetchTlb::Idle;
+
+            if arbiter == Arbiter::Walk {
+                walk_stale <- true;
+            }
+        }
+
+        if tlb_flush || trap_taken {
+            ifault_valid <- false;
+        }
+    }
+}

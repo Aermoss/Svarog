@@ -1,0 +1,108 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+module MulDiv(
+    clk: in clock,
+    rst: in reset,
+    left: in u32,
+    right: in u32,
+    op: in u3,
+    start: in bool,
+    result: out u32,
+    ready: out reg bool = false
+) {
+    reg multiplicand: u33 = 0;
+    reg multiplier: u33 = 0;
+    reg product: u66 = 0;
+    reg multiplying: bool = false;
+    reg high: bool = false;
+    reg dividing: bool = false;
+
+    reg dividend: u32 = 0;
+    reg divisor: u32 = 0;
+    reg preparing: bool = false;
+    reg signed_division: bool = false;
+    reg remainder_wanted: bool = false;
+    reg count: u6 = 0;
+    reg quotient: u32 = 0;
+    reg remainder: u32 = 0;
+    reg denominator: u32 = 0;
+    reg busy: bool = false;
+    reg negate_quotient: bool = false;
+    reg negate_remainder: bool = false;
+    reg finishing: bool = false;
+    reg division_result: u32 = 0;
+
+    let is_division = op[2];
+    let left_signed = op == 1 || op == 2;
+    let right_signed = op == 1;
+    let difference = cat(false, remainder[30:0], quotient[31]) - cat(false, denominator);
+    let final_quotient: u32 = if divisor == 0 { 0xFFFFFFFF } else if negate_quotient { 0 - quotient } else { quotient };
+    let final_remainder: u32 = if divisor == 0 { dividend } else if negate_remainder { 0 - remainder } else { remainder };
+
+    result = if dividing { division_result } else if high { product[63:32] } else { product[31:0] };
+
+    seq {
+        product <- ((multiplicand as i33 as i66) * (multiplier as i33 as i66)) as u66;
+
+        if start {
+            ready <- false;
+            multiplicand <- cat(left_signed && left[31], left);
+            multiplier <- cat(right_signed && right[31], right);
+            multiplying <- !is_division;
+            high <- op != 0;
+            dividing <- is_division;
+            dividend <- left;
+            divisor <- right;
+            signed_division <- op == 4 || op == 6;
+            remainder_wanted <- op[1];
+            finishing <- false;
+            preparing <- is_division;
+            busy <- false;
+        } else if multiplying {
+            multiplying <- false;
+            ready <- true;
+        } else if preparing {
+            preparing <- false;
+            count <- 32;
+            quotient <- if signed_division && dividend[31] { 0 - dividend } else { dividend };
+            denominator <- if signed_division && divisor[31] { 0 - divisor } else { divisor };
+            remainder <- 0;
+            busy <- true;
+            negate_quotient <- signed_division && !remainder_wanted && (dividend[31] ^ divisor[31]) && divisor != 0;
+            negate_remainder <- signed_division && remainder_wanted && dividend[31] && divisor != 0;
+        } else if busy {
+            if count != 0 {
+                count <- count - 1;
+
+                if difference[32] {
+                    remainder <- cat(remainder[30:0], quotient[31]);
+                    quotient <- cat(quotient[30:0], false);
+                } else {
+                    remainder <- difference[31:0];
+                    quotient <- cat(quotient[30:0], true);
+                }
+            } else {
+                busy <- false;
+                finishing <- true;
+            }
+        } else if finishing {
+            finishing <- false;
+            division_result <- if remainder_wanted { final_remainder } else { final_quotient };
+            ready <- true;
+        }
+    }
+}

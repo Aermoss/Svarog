@@ -1,0 +1,210 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "Config.vel", "Core.vel", "Memory.vel", "IO.vel", "Bus.vel"]
+
+module System(
+    clk: in clock,
+    rst: in reset,
+    fast: in bool,
+
+    uart_rx: in bool,
+    uart_tx: out bool,
+    sd_clk: out bool,
+    sd_mosi: out bool,
+    sd_miso: in bool,
+    sd_cs_n: out bool,
+    button: in bool,
+    leds: out u6,
+    ws2812: out bool,
+
+    video_write: out bool,
+    video_address: out u12,
+    video_data: out u16,
+    video_cursor: out u16,
+    video_scroll: out u5,
+
+    flash_request: out bool,
+    flash_address: out u24,
+    flash_data: in u32,
+    flash_ready: in bool,
+
+    sdram_start: out bool,
+    sdram_write: out bool,
+    sdram_length: out u3,
+    sdram_address: out u21,
+    sdram_data: out u32,
+    sdram_dqm: out u4,
+    sdram_ready: in bool,
+    sdram_valid: in bool,
+    sdram_read_data: in u32
+) {
+    for i in 0..CORE_COUNT {
+        if i > 0 {
+            reg held: bool = true;
+
+            seq {
+                held <- !io.running[i];
+            }
+        }
+
+        let core = Core {
+            rst: if i == 0 { rst } else { held },
+            core_id: i as u<CORE_BITS>,
+            reset_vector: if i == 0 { 0 } else { io.start_address },
+            fetch_instruction: memory.fetch_instruction,
+            fetch_hit: memory.fetch_hit,
+            fetch_fault: memory.fetch_fault,
+            fetch_busy: memory.fetch_busy,
+            m1_load_data: memory.m1_load_data,
+            m2_replay: memory.m2_replay,
+            m2_wait: memory.m2_wait,
+            data_fault: memory.data_fault,
+            data_busy: memory.data_busy,
+            interrupt_lines: io.interrupts[i],
+            interrupt_block: memory.locked,
+            drained: memory.drained,
+            reservation_kill: memory.reservation_kill,
+            cycle_counter: io.cycle_counter,
+            ms_counter: io.ms_counter
+        };
+
+        let memory = Memory {
+            rst: if i == 0 { rst } else { held },
+            fetch_pc: core.fetch_pc,
+            fetch_redirect: core.fetch_redirect,
+            fetch_redirect_pc: core.fetch_redirect_pc,
+            fetch_sequential_pc: core.fetch_sequential_pc,
+            fetch_valid: core.fetch_valid,
+            fetch_hold: core.fetch_hold,
+            data_address: core.data_address,
+            data_hold: core.data_hold,
+            m1_access: core.m1_access,
+            m1_address: core.m1_address,
+            m1_load: core.m1_load,
+            m1_store: core.m1_store,
+            m1_size: core.m1_size,
+            m1_signed: core.m1_signed,
+            m2_commit: core.m2_commit,
+            m2_retry: core.m2_retry,
+            store_commit: core.store_commit,
+            store_data: core.store_data,
+            store_mask: core.store_mask,
+            user_mode: core.user_mode,
+            ptbase: core.csr_ptbase,
+            asid: core.csr_asid,
+            tlb_flush: core.tlb_flush,
+            cache_flush: core.cache_flush,
+            icache_flush: core.icache_flush,
+            trap_taken: core.trap_taken,
+            io_word: io.read_word,
+            flash_data,
+            flash_ready: if CORE_COUNT > 1 { bus.core_flash_ready[i] } else { flash_ready },
+            sdram_ready: if CORE_COUNT > 1 { bus.core_sdram_ready[i] } else { sdram_ready },
+            sdram_valid: if CORE_COUNT > 1 { bus.core_sdram_valid[i] } else { sdram_valid },
+            sdram_read_data,
+            flush_all: bus.flush_all,
+            tx_done: bus.core_tx_done[i],
+            tx_result: bus.tx_result,
+            shared_fetch_grant: bus.core_fetch_grant[i],
+            shared_fetch_word: bus.fetch_word,
+            own_grant: bus.core_own_grant[i],
+            snoop_valid: bus.core_snoop_valid[i],
+            snoop_line: bus.snoop_line
+        };
+
+        let retired = core.instret;
+
+        if CORE_COUNT > 1 {
+            let flush = core.cache_flush || core.icache_flush;
+        }
+    }
+
+    if CORE_COUNT > 1 {
+        let bus = Bus {
+            core_sdram_request: memory.sdram_request,
+            core_sdram_start: memory.sdram_start,
+            core_sdram_write: memory.sdram_write,
+            core_sdram_length: memory.sdram_length,
+            core_sdram_address: memory.sdram_address,
+            core_sdram_data: memory.sdram_data,
+            core_sdram_dqm: memory.sdram_dqm,
+            sdram_ready,
+            sdram_valid,
+            core_flash_request: memory.flash_request,
+            core_flash_address: memory.flash_address,
+            flash_ready,
+            core_tx_request: memory.tx_request,
+            core_tx_address: memory.tx_address,
+            core_tx_write_enable: memory.tx_write_enable,
+            core_tx_write_data: memory.tx_write_data,
+            io_word: io.read_word,
+            core_fetch_request: memory.shared_fetch_request,
+            core_fetch_address: core.fetch_pc,
+            core_flush: flush,
+            core_own_request: memory.own_request,
+            core_own_line: memory.own_line,
+            core_snoop_ack: memory.snoop_ack,
+            running: io.running
+        };
+    }
+
+    let io = IO {
+        fast,
+        source: bus.io_source,
+        read_index: if CORE_COUNT > 1 { bus.io_index } else { memory[0].io_index },
+        access: if CORE_COUNT > 1 { bus.io_access } else { memory[0].io_access },
+        address: if CORE_COUNT > 1 { bus.io_address } else { memory[0].io_address },
+        write_enable: if CORE_COUNT > 1 { bus.io_write_enable } else { memory[0].io_write_enable },
+        write_data: if CORE_COUNT > 1 { bus.io_write_data } else { memory[0].io_write_data },
+        instret: retired,
+        uart_rx,
+        sd_miso,
+        button
+    };
+
+    uart_tx = io.uart_tx;
+    sd_clk = io.sd_clk;
+    sd_mosi = io.sd_mosi;
+    sd_cs_n = io.sd_cs_n;
+    leds = io.leds;
+    ws2812 = io.ws2812;
+    video_write = io.video_write;
+    video_address = io.video_address;
+    video_data = io.video_data;
+    video_cursor = io.video_cursor;
+    video_scroll = io.video_scroll;
+
+    if CORE_COUNT == 1 {
+        flash_request = memory[0].flash_request;
+        flash_address = memory[0].flash_address;
+        sdram_start = memory[0].sdram_start;
+        sdram_write = memory[0].sdram_write;
+        sdram_length = memory[0].sdram_length;
+        sdram_address = memory[0].sdram_address;
+        sdram_data = memory[0].sdram_data;
+        sdram_dqm = memory[0].sdram_dqm;
+    } else {
+        flash_request = bus.flash_request;
+        flash_address = bus.flash_address;
+        sdram_start = bus.sdram_start;
+        sdram_write = bus.sdram_write;
+        sdram_length = bus.sdram_length;
+        sdram_address = bus.sdram_address;
+        sdram_data = bus.sdram_data;
+        sdram_dqm = bus.sdram_dqm;
+    }
+}

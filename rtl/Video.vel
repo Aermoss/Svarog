@@ -1,0 +1,179 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "TMDSEncoder.vel"]
+
+const VIDEO_COLUMNS = 80;
+const VIDEO_ROWS = 30;
+const H_VISIBLE: u10 = 640;
+const H_SYNC_START: u10 = 656;
+const H_SYNC_END: u10 = 752;
+const H_TOTAL: u10 = 800;
+const V_VISIBLE: u10 = 480;
+const V_SYNC_START: u10 = 490;
+const V_SYNC_END: u10 = 492;
+const V_TOTAL: u10 = 525;
+
+module Video(
+    cpu_clk: in clock,
+    pixel_clk: in clock,
+    video_rst: in reset,
+    text_write: in bool,
+    text_address: in u12,
+    text_data: in u16,
+    cursor: in u16,
+    scroll: in u5,
+    symbol_blue: out u10,
+    symbol_green: out u10,
+    symbol_red: out u10
+) {
+    reg text: [u16; 2400];
+    reg font: [u8; 4096] = readmemh("C:/Users/rencb/Documents/GitHub/Svarog/font.hex");
+    reg cursor_sync0: u16 = 0;
+    reg cursor_sync1: u16 = 0;
+    reg scroll_sync0: u5 = 0;
+    reg scroll_sync1: u5 = 0;
+    reg h: u10 = 0;
+    reg v: u10 = 0;
+    reg frame: u6 = 0;
+    reg cell_word: u16;
+    reg glyph_row: u8;
+    reg pixel1: u3;
+    reg pixel2: u3;
+    reg line1: u4;
+    reg active1: bool = false;
+    reg active2: bool = false;
+    reg active3: bool = false;
+    reg hsync1: bool = true;
+    reg hsync2: bool = true;
+    reg hsync3: bool = true;
+    reg vsync1: bool = true;
+    reg vsync2: bool = true;
+    reg vsync3: bool = true;
+    reg cursor1: bool;
+    reg cursor2: bool;
+    reg colors2: u8;
+    reg rgb: u24;
+    wire color_rgb: u24;
+
+    let row = v[8:4];
+    let column = h[9:3];
+    let row_sum = (row as u6) + (scroll_sync1 as u6);
+    let shown_row = (if row_sum >= 30 { row_sum - 30 } else { row_sum })[4:0];
+    let cell_index = (shown_row as u12) * 80 + (column as u12);
+    let foreground = glyph_row[7 - pixel2] || cursor2;
+    let color = if foreground { colors2[3:0] } else { colors2[7:4] };
+
+    let blue = TMDSEncoder {
+        clk: pixel_clk,
+        rst: video_rst,
+        data: rgb[7:0],
+        control: cat(vsync3, hsync3),
+        active: active3
+    };
+
+    let green = TMDSEncoder {
+        clk: pixel_clk,
+        rst: video_rst,
+        data: rgb[15:8],
+        control: 0,
+        active: active3
+    };
+
+    let red = TMDSEncoder {
+        clk: pixel_clk,
+        rst: video_rst,
+        data: rgb[23:16],
+        control: 0,
+        active: active3
+    };
+
+    symbol_blue = blue.symbol;
+    symbol_green = green.symbol;
+    symbol_red = red.symbol;
+
+    comb {
+        color_rgb = 0xFFFFFF;
+
+        match color {
+            0x0 => color_rgb = 0x000000,
+            0x1 => color_rgb = 0x0000AA,
+            0x2 => color_rgb = 0x00AA00,
+            0x3 => color_rgb = 0x00AAAA,
+            0x4 => color_rgb = 0xAA0000,
+            0x5 => color_rgb = 0xAA00AA,
+            0x6 => color_rgb = 0xAA5500,
+            0x7 => color_rgb = 0xAAAAAA,
+            0x8 => color_rgb = 0x555555,
+            0x9 => color_rgb = 0x5555FF,
+            0xA => color_rgb = 0x55FF55,
+            0xB => color_rgb = 0x55FFFF,
+            0xC => color_rgb = 0xFF5555,
+            0xD => color_rgb = 0xFF55FF,
+            0xE => color_rgb = 0xFFFF55,
+            _ => {}
+        }
+    }
+
+    seq(cpu_clk) {
+        if text_write && text_address < 2400 {
+            text[text_address] <- text_data;
+        }
+    }
+
+    seq(pixel_clk) {
+        cursor_sync0 <- cursor;
+        cursor_sync1 <- cursor_sync0;
+        scroll_sync0 <- scroll;
+        scroll_sync1 <- scroll_sync0;
+
+        cell_word <- text[cell_index];
+        pixel1 <- h[2:0];
+        line1 <- v[3:0];
+        cursor1 <- cursor_sync1[15] && column == cursor_sync1[6:0] && row == cursor_sync1[12:8] && frame[5];
+
+        glyph_row <- font[cat(cell_word[7:0], line1)];
+        colors2 <- cell_word[15:8];
+        pixel2 <- pixel1;
+        cursor2 <- cursor1 && line1 >= 14;
+        rgb <- color_rgb;
+    }
+
+    seq(pixel_clk, video_rst) {
+        active1 <- h < H_VISIBLE && v < V_VISIBLE;
+        hsync1 <- !(h >= H_SYNC_START && h < H_SYNC_END);
+        vsync1 <- !(v >= V_SYNC_START && v < V_SYNC_END);
+        active2 <- active1;
+        hsync2 <- hsync1;
+        vsync2 <- vsync1;
+        active3 <- active2;
+        hsync3 <- hsync2;
+        vsync3 <- vsync2;
+
+        if h == H_TOTAL - 1 {
+            h <- 0;
+
+            if v == V_TOTAL - 1 {
+                v <- 0;
+                frame <- frame + 1;
+            } else {
+                v <- v + 1;
+            }
+        } else {
+            h <- h + 1;
+        }
+    }
+}

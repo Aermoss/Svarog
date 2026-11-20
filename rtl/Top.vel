@@ -1,0 +1,252 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "System.vel", "Flash.vel", "SDRAM.vel", "Video.vel"]
+
+extern module Gowin_rPLL(clkin: in clock, reset: in bool, clkout: out clock, clkoutp: out clock, lock: out bool);
+
+extern module Gowin_rPLL_video(clkin: in clock, clkout: out clock, lock: out bool);
+
+extern module SDRAM_Controller_HS_Top(
+    O_sdram_clk: out bool,
+    O_sdram_cke: out bool,
+    O_sdram_cs_n: out bool,
+    O_sdram_cas_n: out bool,
+    O_sdram_ras_n: out bool,
+    O_sdram_wen_n: out bool,
+    O_sdram_dqm: out u4,
+    O_sdram_addr: out u11,
+    O_sdram_ba: out u2,
+    IO_sdram_dq: inout u32,
+    I_sdrc_rst_n: in bool,
+    I_sdrc_clk: in clock,
+    I_sdram_clk: in clock,
+    I_sdrc_cmd_en: in bool,
+    I_sdrc_cmd: in u3,
+    I_sdrc_precharge_ctrl: in bool,
+    I_sdram_power_down: in bool,
+    I_sdram_selfrefresh: in bool,
+    I_sdrc_addr: in u21,
+    I_sdrc_dqm: in u4,
+    I_sdrc_data: in u32,
+    I_sdrc_data_len: in u8,
+    O_sdrc_data: out u32,
+    O_sdrc_init_done: out bool,
+    O_sdrc_cmd_ack: out bool
+);
+
+extern module CLKDIV<DIV_MODE, GSREN>(RESETN: in bool, HCLKIN: in clock, CLKOUT: out clock, CALIB: in bool);
+
+extern module OSER10<GSREN, LSREN>(
+    Q: out bool,
+    D0: in bool,
+    D1: in bool,
+    D2: in bool,
+    D3: in bool,
+    D4: in bool,
+    D5: in bool,
+    D6: in bool,
+    D7: in bool,
+    D8: in bool,
+    D9: in bool,
+    PCLK: in clock,
+    FCLK: in clock,
+    RESET: in bool
+);
+
+extern module ELVDS_OBUF(I: in bool, O: out bool, OB: out bool);
+
+module Top(
+    clk: in clock,
+    rst: in bool,
+    uart_rx: in bool,
+    uart_tx: out bool,
+    sd_clk: out bool,
+    sd_mosi: out bool,
+    sd_miso: in bool,
+    sd_cs_n: out bool,
+    button: in bool,
+    leds: out u6,
+    ws2812: out bool,
+    tmds_clk_p: out bool,
+    tmds_clk_n: out bool,
+    tmds_d_p: out u3,
+    tmds_d_n: out u3,
+    spi_cs_pin: out bool,
+    spi_clk_pin: out bool,
+    spi_mosi_pin: out bool,
+    spi_miso_pin: in bool,
+    O_sdram_clk: out bool,
+    O_sdram_cke: out bool,
+    O_sdram_cs_n: out bool,
+    O_sdram_cas_n: out bool,
+    O_sdram_ras_n: out bool,
+    O_sdram_wen_n: out bool,
+    O_sdram_dqm: out u4,
+    O_sdram_addr: out u11,
+    O_sdram_ba: out u2,
+    IO_sdram_dq: inout u32
+) {
+    let pll0 = Gowin_rPLL { clkin: clk, reset: rst };
+    let sys_clk = pll0.clkout;
+    reg counter: u8 = 0;
+    reg rst_reg: bool;
+
+    seq(sys_clk) {
+        if !pll0.lock {
+            counter <- 0;
+            rst_reg <- true;
+        } else if counter < 0xFF {
+            counter <- counter + 1;
+            rst_reg <- true;
+        } else {
+            rst_reg <- rst;
+        }
+    }
+
+    let system0 = System {
+        clk: sys_clk,
+        rst: rst_reg,
+        fast: false,
+        uart_rx,
+        sd_miso,
+        button,
+        flash_data: flash0.read_data,
+        flash_ready: flash0.ready,
+        sdram_ready: sdram0.ready,
+        sdram_valid: sdram0.read_valid,
+        sdram_read_data: sdram0.read_data
+    };
+
+    uart_tx = system0.uart_tx;
+    sd_clk = system0.sd_clk;
+    sd_mosi = system0.sd_mosi;
+    sd_cs_n = system0.sd_cs_n;
+    leds = system0.leds;
+    ws2812 = system0.ws2812;
+
+    let flash0 = Flash {
+        clk: sys_clk,
+        rst: rst_reg,
+        request: system0.flash_request,
+        address: system0.flash_address,
+        flash_miso: spi_miso_pin
+    };
+
+    spi_cs_pin = flash0.flash_cs;
+    spi_clk_pin = flash0.flash_sck;
+    spi_mosi_pin = flash0.flash_mosi;
+
+    let sdram0 = SDRAM {
+        clk: sys_clk,
+        rst: rst_reg,
+        start: system0.sdram_start,
+        write: system0.sdram_write,
+        length: system0.sdram_length,
+        address: system0.sdram_address,
+        data: system0.sdram_data,
+        dqm: system0.sdram_dqm,
+        sdrc_data_r: sdrc0.O_sdrc_data,
+        sdrc_init_done: sdrc0.O_sdrc_init_done,
+        sdrc_cmd_ack: sdrc0.O_sdrc_cmd_ack
+    };
+
+    let sdrc0 = SDRAM_Controller_HS_Top {
+        IO_sdram_dq,
+        I_sdrc_rst_n: !rst_reg,
+        I_sdrc_clk: sys_clk,
+        I_sdram_clk: pll0.clkoutp,
+        I_sdrc_cmd_en: sdram0.sdrc_cmd_en,
+        I_sdrc_cmd: sdram0.sdrc_cmd,
+        I_sdrc_precharge_ctrl: true,
+        I_sdram_power_down: false,
+        I_sdram_selfrefresh: false,
+        I_sdrc_addr: sdram0.sdrc_addr,
+        I_sdrc_dqm: sdram0.sdrc_dqm,
+        I_sdrc_data: sdram0.sdrc_data_w,
+        I_sdrc_data_len: sdram0.sdrc_data_len
+    };
+
+    O_sdram_clk = sdrc0.O_sdram_clk;
+    O_sdram_cke = sdrc0.O_sdram_cke;
+    O_sdram_cs_n = sdrc0.O_sdram_cs_n;
+    O_sdram_cas_n = sdrc0.O_sdram_cas_n;
+    O_sdram_ras_n = sdrc0.O_sdram_ras_n;
+    O_sdram_wen_n = sdrc0.O_sdram_wen_n;
+    O_sdram_dqm = sdrc0.O_sdram_dqm;
+    O_sdram_addr = sdrc0.O_sdram_addr;
+    O_sdram_ba = sdrc0.O_sdram_ba;
+
+    let video_pll = Gowin_rPLL_video { clkin: clk };
+    let serial_clk = video_pll.clkout;
+    let divider = CLKDIV<DIV_MODE: "5", GSREN: "false"> { RESETN: video_pll.lock, HCLKIN: serial_clk, CALIB: true };
+    let pixel_clk = divider.CLKOUT;
+    let video_unlocked = !video_pll.lock;
+    reg video_reset: u2 = 3;
+
+    seq(pixel_clk, video_unlocked) {
+        video_reset <- cat(video_reset[0], rst_reg);
+    }
+
+    let video0 = Video {
+        cpu_clk: sys_clk,
+        pixel_clk,
+        video_rst: video_reset[1],
+        text_write: system0.video_write,
+        text_address: system0.video_address,
+        text_data: system0.video_data,
+        cursor: system0.video_cursor,
+        scroll: system0.video_scroll
+    };
+
+    let blue = video0.symbol_blue;
+    let green = video0.symbol_green;
+    let red = video0.symbol_red;
+
+    let serializer_blue = OSER10<GSREN: "false", LSREN: "true"> {
+        D0: blue[0], D1: blue[1], D2: blue[2], D3: blue[3], D4: blue[4],
+        D5: blue[5], D6: blue[6], D7: blue[7], D8: blue[8], D9: blue[9],
+        PCLK: pixel_clk, FCLK: serial_clk, RESET: video_unlocked
+    };
+
+    let serializer_green = OSER10<GSREN: "false", LSREN: "true"> {
+        D0: green[0], D1: green[1], D2: green[2], D3: green[3], D4: green[4],
+        D5: green[5], D6: green[6], D7: green[7], D8: green[8], D9: green[9],
+        PCLK: pixel_clk, FCLK: serial_clk, RESET: video_unlocked
+    };
+
+    let serializer_red = OSER10<GSREN: "false", LSREN: "true"> {
+        D0: red[0], D1: red[1], D2: red[2], D3: red[3], D4: red[4],
+        D5: red[5], D6: red[6], D7: red[7], D8: red[8], D9: red[9],
+        PCLK: pixel_clk, FCLK: serial_clk, RESET: video_unlocked
+    };
+
+    let serializer_clock = OSER10<GSREN: "false", LSREN: "true"> {
+        D0: false, D1: false, D2: false, D3: false, D4: false,
+        D5: true, D6: true, D7: true, D8: true, D9: true,
+        PCLK: pixel_clk, FCLK: serial_clk, RESET: video_unlocked
+    };
+
+    let buffer_blue = ELVDS_OBUF { I: serializer_blue.Q };
+    let buffer_green = ELVDS_OBUF { I: serializer_green.Q };
+    let buffer_red = ELVDS_OBUF { I: serializer_red.Q };
+    let buffer_clock = ELVDS_OBUF { I: serializer_clock.Q };
+
+    tmds_d_p = cat(buffer_red.O, buffer_green.O, buffer_blue.O);
+    tmds_d_n = cat(buffer_red.OB, buffer_green.OB, buffer_blue.OB);
+    tmds_clk_p = buffer_clock.O;
+    tmds_clk_n = buffer_clock.OB;
+}

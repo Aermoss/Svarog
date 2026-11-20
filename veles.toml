@@ -1,0 +1,57 @@
+[project]
+name = "Svarog"
+top = "rtl/Top.vel"
+output = "rtl/build/Svarog.sv"
+build = "build"
+backend = "gowin"
+before = ["make boot0.hex boot1.hex boot2.hex boot3.hex"]
+
+[board]
+name = "tangnano20k"
+constraints = "tangnano20k.cst"
+timing = "tangnano20k.sdc"
+
+[gowin]
+files = [
+    "C:/Gowin/Gowin_V1.9.12.02_SP2_x64/IDE/bin/Documents/Svarog/src/gowin_rpll/gowin_rpll.v",
+    "C:/Gowin/Gowin_V1.9.12.02_SP2_x64/IDE/bin/Documents/Svarog/src/gowin_rpll/gowin_rpll_video.v",
+    "C:/Gowin/Gowin_V1.9.12.02_SP2_x64/IDE/bin/Documents/Svarog/src/sdram_controller_hs/sdram_controller_hs.v"
+]
+options = ["-use_mspi_as_gpio 1", "-use_sspi_as_gpio 0", "-loading_rate 250/10"]
+
+[[flash]]
+file = "../Triglav/bin/Triglav.bin"
+address = 0x100000
+
+[tests]
+simulator = "verilator"
+top = "BoardTB"
+bench = [
+    "rtl/sim/BoardTB.sv",
+    "rtl/sim/SDRAMChip.sv",
+    "rtl/sim/SPIFlash.sv",
+    "rtl/sim/SDCard.sv",
+    "rtl/sim/PLL.sv",
+    "C:/Gowin/Gowin_V1.9.12.02_SP2_x64/IDE/bin/Documents/Svarog/src/gowin_rpll/gowin_rpll.v",
+    "C:/Gowin/Gowin_V1.9.12.02_SP2_x64/IDE/bin/Documents/Svarog/src/gowin_rpll/gowin_rpll_video.v",
+    "C:/Gowin/Gowin_V1.9.12.02_SP2_x64/IDE/bin/Documents/Svarog/src/sdram_controller_hs/sdram_controller_hs.vo"
+]
+library = ["C:/Gowin/Gowin_V1.9.12.02_SP2_x64/IDE/simlib/gw2a/prim_sim.v"]
+args = ["+flash=../Triglav/bin/Triglav.bin"]
+
+[[test]]
+name = "Reset"
+args = ["+timeout_us=480"]
+expect = "SDRAM: 0 timing violations"
+wave_from_us = 440
+
+[[test]]
+name = "Boot"
+args = ["+stop=Triglav kernel started.", "+timeout_us=250000", "+trace=build/sim/Boot.trace"]
+expect = "STOPPED"
+after = ['bin\svarog-emu.exe boot.hex --flash=../Triglav/bin/Triglav.bin --follow=build/sim/Boot.trace --quiet']
+
+[[test]]
+name = "Shell"
+args = ["+sd=../Triglav/bin/Card.img", "+after=triglav:/$ ", '+keys=help\r', "+stop=the SD card is used", "+timeout_us=600000", "+screen=build/sim/Shell.ppm", "+leds"]
+expect = "STOPPED"

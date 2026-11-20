@@ -1,0 +1,77 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+const WS2812_TOTAL: u16 = 101;
+const WS2812_ONE_HIGH: u16 = 65;
+const WS2812_ZERO_HIGH: u16 = 32;
+const WS2812_RESET: u16 = 20250;
+
+enum Ws2812State { Idle, Send, Reset }
+
+module WS2812(
+    clk: in clock,
+    rst: in reset,
+    strobe: in bool,
+    write: in u24,
+    out_pin: out reg bool = false
+) {
+    reg state: Ws2812State = Ws2812State::Idle;
+    reg bits: u5 = 0;
+    reg cycles: u16 = 0;
+    reg shift: u24 = 0;
+
+    seq {
+        match state {
+            Ws2812State::Idle => {
+                out_pin <- false;
+                cycles <- 0;
+
+                if strobe {
+                    state <- Ws2812State::Send;
+                    bits <- 24;
+                    shift <- write;
+                }
+            },
+            Ws2812State::Send => {
+                out_pin <- cycles < (if shift[23] { WS2812_ONE_HIGH } else { WS2812_ZERO_HIGH });
+
+                if cycles < WS2812_TOTAL {
+                    cycles <- cycles + 1;
+                } else {
+                    cycles <- 0;
+                    shift <- shift << 1;
+
+                    if bits > 1 {
+                        bits <- bits - 1;
+                    } else {
+                        bits <- 0;
+                        state <- Ws2812State::Reset;
+                    }
+                }
+            },
+            Ws2812State::Reset => {
+                out_pin <- false;
+
+                if cycles < WS2812_RESET {
+                    cycles <- cycles + 1;
+                } else {
+                    cycles <- 0;
+                    state <- Ws2812State::Idle;
+                }
+            }
+        }
+    }
+}

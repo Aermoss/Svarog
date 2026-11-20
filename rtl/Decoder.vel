@@ -1,0 +1,294 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+enum Opcode: u6 {
+    Nop, Lb, Lbu, Lh, Lhu, Lw, Lui, Auipc, Sb, Sh, Sw,
+    B, Br, Bl, Blr, Beq, Bne, Blt, Bltu, Bge, Bgeu,
+    Slt, Sltu, Slti, Sltiu,
+    Add, Addi, Sub, Subi,
+    Mul, Mulh, Mulhsu, Mulhu, Div, Divu, Rem, Remu,
+    And, Andi, Or, Ori, Xor, Xori,
+    Sll, Slli, Srl, Srli, Sra, Srai,
+    Csrrw, Csrrs, Csrrc, Csrrwi, Csrrsi, Csrrci,
+    Ecall, Ebreak, Eret, Wfi,
+    Lr, Sc, Amo, Fence, Hlt
+}
+
+const FAULT_NONE: u3 = 0;
+const FAULT_FETCH: u3 = 1;
+const FAULT_ILLEGAL: u3 = 2;
+const FAULT_BREAK: u3 = 3;
+const FAULT_DATA: u3 = 4;
+
+const CSR_STATUS: u16 = 0;
+const CSR_IENABLE: u16 = 1;
+const CSR_IPENDING: u16 = 2;
+const CSR_EPC: u16 = 3;
+const CSR_CAUSE: u16 = 4;
+const CSR_VECTOR: u16 = 5;
+const CSR_SCRATCH: u16 = 6;
+const CSR_BADADDR: u16 = 7;
+const CSR_PTBASE: u16 = 8;
+const CSR_ASID: u16 = 9;
+const CSR_TLBFLUSH: u16 = 10;
+const CSR_CYCLE: u16 = 16;
+const CSR_INSTRET: u16 = 17;
+const CSR_TIME: u16 = 18;
+const CSR_COREID: u16 = 19;
+
+module Decoder(
+    instruction: in u32,
+    pc: in u32,
+    next: in u32,
+    user_mode: in bool,
+    fetch_fault: in bool,
+    opcode: out Opcode,
+    rs0: out u5,
+    rs1: out u5,
+    rs2: out u5,
+    reads: out u3,
+    writes: out bool,
+    load: out bool,
+    late: out bool,
+    use_imm: out bool,
+    imm: out u32,
+    op_add: out bool,
+    op_sub: out bool,
+    op_and: out bool,
+    op_or: out bool,
+    op_xor: out bool,
+    op_sll: out bool,
+    op_srl: out bool,
+    op_sra: out bool,
+    op_less: out bool,
+    op_static: out bool,
+    compare_signed: out bool,
+    static_value: out u32,
+    multicycle: out bool,
+    muldiv: out u3,
+    branch_always: out bool,
+    branch_eq: out bool,
+    branch_ne: out bool,
+    branch_lt: out bool,
+    branch_ge: out bool,
+    branch_signed: out bool,
+    jump_reg0: out bool,
+    jump_reg1: out bool,
+    direct: out bool,
+    target: out u32,
+    offset: out u32,
+    memory_load: out bool,
+    memory_store: out bool,
+    atomic: out bool,
+    size: out u2,
+    load_signed: out bool,
+    csr_op: out bool,
+    csr_writes: out bool,
+    csr_immediate: out bool,
+    system: out bool,
+    fault: out u3
+) {
+    let code = instruction[31:26] as Opcode;
+    let csr = instruction[15:0];
+    let simm16 = (instruction[15:0] as i16 as i32) as u32;
+    let simm21 = (instruction[20:0] as i21 as i32) as u32;
+    let simm26 = (instruction[25:0] as i26 as i32) as u32;
+    let upper = cat(instruction[20:0], 0 as u11);
+    let csr_read_only = csr >= CSR_CYCLE && csr <= CSR_COREID;
+    let is_csr = code == Opcode::Csrrw || code == Opcode::Csrrs || code == Opcode::Csrrc || code == Opcode::Csrrwi || code == Opcode::Csrrsi || code == Opcode::Csrrci;
+    let csr_write = code == Opcode::Csrrw || code == Opcode::Csrrwi || (is_csr && instruction[20:16] != 0);
+    let branch_offset: u32 = if code == Opcode::B { simm26 } else if code == Opcode::Bl { simm21 } else { simm16 };
+    wire privileged: bool;
+
+    opcode = code;
+    rs0 = instruction[25:21];
+    rs1 = instruction[20:16];
+    rs2 = instruction[15:11];
+    target = pc + (branch_offset << 2);
+    offset = if memory_load || memory_store { simm16 } else { 0 };
+    csr_op = is_csr;
+    csr_writes = csr_write;
+    csr_immediate = code == Opcode::Csrrwi || code == Opcode::Csrrsi || code == Opcode::Csrrci;
+    direct = code == Opcode::B || code == Opcode::Bl;
+    branch_always = code == Opcode::B || code == Opcode::Br || code == Opcode::Bl || code == Opcode::Blr;
+    branch_eq = code == Opcode::Beq;
+    branch_ne = code == Opcode::Bne;
+    branch_lt = code == Opcode::Blt || code == Opcode::Bltu;
+    branch_ge = code == Opcode::Bge || code == Opcode::Bgeu;
+    branch_signed = code == Opcode::Blt || code == Opcode::Bge;
+    jump_reg0 = code == Opcode::Br;
+    jump_reg1 = code == Opcode::Blr;
+    atomic = code == Opcode::Lr || code == Opcode::Sc || code == Opcode::Amo;
+    memory_load = code == Opcode::Lb || code == Opcode::Lbu || code == Opcode::Lh || code == Opcode::Lhu || code == Opcode::Lw;
+    memory_store = code == Opcode::Sb || code == Opcode::Sh || code == Opcode::Sw;
+    size = if code == Opcode::Lb || code == Opcode::Lbu || code == Opcode::Sb { 0 } else if code == Opcode::Lh || code == Opcode::Lhu || code == Opcode::Sh { 1 } else { 2 };
+    load_signed = code == Opcode::Lb || code == Opcode::Lh;
+    load = memory_load || code == Opcode::Lr || code == Opcode::Amo;
+    late = is_csr || code == Opcode::Sc;
+    system = code == Opcode::Ecall || code == Opcode::Eret || code == Opcode::Hlt || (code == Opcode::Fence && instruction[0]) ||
+        (csr_write && (csr == CSR_PTBASE || csr == CSR_ASID || csr == CSR_TLBFLUSH));
+
+    comb {
+        reads = 0;
+
+        match code {
+            Opcode::Br | Opcode::Beq | Opcode::Bne | Opcode::Blt | Opcode::Bltu | Opcode::Bge | Opcode::Bgeu | Opcode::Sb | Opcode::Sh | Opcode::Sw => reads = 0b011,
+            Opcode::Nop | Opcode::Lui | Opcode::Auipc | Opcode::B | Opcode::Bl | Opcode::Csrrwi | Opcode::Csrrsi | Opcode::Csrrci |
+            Opcode::Ecall | Opcode::Ebreak | Opcode::Eret | Opcode::Wfi | Opcode::Fence | Opcode::Hlt => reads = 0b000,
+            Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Mulh | Opcode::Mulhsu | Opcode::Mulhu | Opcode::Div | Opcode::Divu | Opcode::Rem | Opcode::Remu |
+            Opcode::And | Opcode::Or | Opcode::Xor | Opcode::Sll | Opcode::Srl | Opcode::Sra | Opcode::Slt | Opcode::Sltu | Opcode::Sc | Opcode::Amo => reads = 0b110,
+            _ => reads = 0b010
+        }
+    }
+
+    comb {
+        writes = false;
+
+        match code {
+            Opcode::Lui | Opcode::Auipc | Opcode::Slt | Opcode::Sltu | Opcode::Slti | Opcode::Sltiu | Opcode::Add | Opcode::Addi | Opcode::Sub | Opcode::Subi |
+            Opcode::Mul | Opcode::Mulh | Opcode::Mulhsu | Opcode::Mulhu | Opcode::Div | Opcode::Divu | Opcode::Rem | Opcode::Remu |
+            Opcode::And | Opcode::Andi | Opcode::Or | Opcode::Ori | Opcode::Xor | Opcode::Xori | Opcode::Sll | Opcode::Slli | Opcode::Srl | Opcode::Srli | Opcode::Sra | Opcode::Srai |
+            Opcode::Bl | Opcode::Blr | Opcode::Csrrw | Opcode::Csrrs | Opcode::Csrrc | Opcode::Csrrwi | Opcode::Csrrsi | Opcode::Csrrci |
+            Opcode::Lb | Opcode::Lbu | Opcode::Lh | Opcode::Lhu | Opcode::Lw | Opcode::Lr | Opcode::Sc | Opcode::Amo => writes = true,
+            _ => {}
+        }
+    }
+
+    comb {
+        use_imm = false;
+        imm = instruction[15:0] as u32;
+        op_add = false;
+        op_sub = false;
+        op_and = false;
+        op_or = false;
+        op_xor = false;
+        op_sll = false;
+        op_srl = false;
+        op_sra = false;
+        op_less = false;
+        op_static = false;
+        compare_signed = false;
+        static_value = next;
+        multicycle = false;
+        muldiv = 0;
+
+        match code {
+            Opcode::Lb | Opcode::Lbu | Opcode::Lh | Opcode::Lhu | Opcode::Lw | Opcode::Sb | Opcode::Sh | Opcode::Sw => {
+                op_add = true;
+                use_imm = true;
+                imm = simm16;
+            },
+            Opcode::Add => op_add = true,
+            Opcode::Addi => {
+                op_add = true;
+                use_imm = true;
+                imm = simm16;
+            },
+            Opcode::Sub => op_sub = true,
+            Opcode::Subi => {
+                op_sub = true;
+                use_imm = true;
+                imm = simm16;
+            },
+            Opcode::Mul | Opcode::Mulh | Opcode::Mulhsu | Opcode::Mulhu | Opcode::Div | Opcode::Divu | Opcode::Rem | Opcode::Remu => {
+                multicycle = true;
+                muldiv = instruction[28:26] - 5;
+            },
+            Opcode::And => op_and = true,
+            Opcode::Andi => {
+                op_and = true;
+                use_imm = true;
+            },
+            Opcode::Or => op_or = true,
+            Opcode::Ori => {
+                op_or = true;
+                use_imm = true;
+            },
+            Opcode::Xor => op_xor = true,
+            Opcode::Xori => {
+                op_xor = true;
+                use_imm = true;
+            },
+            Opcode::Sll => op_sll = true,
+            Opcode::Slli => {
+                op_sll = true;
+                use_imm = true;
+            },
+            Opcode::Srl => op_srl = true,
+            Opcode::Srli => {
+                op_srl = true;
+                use_imm = true;
+            },
+            Opcode::Sra => op_sra = true,
+            Opcode::Srai => {
+                op_sra = true;
+                use_imm = true;
+            },
+            Opcode::Slt => {
+                op_less = true;
+                compare_signed = true;
+            },
+            Opcode::Sltu => op_less = true,
+            Opcode::Slti => {
+                op_less = true;
+                compare_signed = true;
+                use_imm = true;
+                imm = simm16;
+            },
+            Opcode::Sltiu => {
+                op_less = true;
+                use_imm = true;
+            },
+            Opcode::Lui => {
+                op_static = true;
+                static_value = upper;
+            },
+            Opcode::Auipc => {
+                op_static = true;
+                static_value = pc + upper;
+            },
+            Opcode::Bl | Opcode::Blr => op_static = true,
+            Opcode::Csrrw | Opcode::Csrrs | Opcode::Csrrc => {
+                op_add = true;
+                use_imm = true;
+                imm = 0;
+            },
+            _ => {}
+        }
+    }
+
+    comb {
+        privileged = false;
+
+        match code {
+            Opcode::Eret | Opcode::Wfi | Opcode::Hlt => privileged = true,
+            Opcode::Csrrw | Opcode::Csrrs | Opcode::Csrrc | Opcode::Csrrwi | Opcode::Csrrsi | Opcode::Csrrci => privileged = csr_write || !csr_read_only,
+            _ => {}
+        }
+    }
+
+    comb {
+        fault = FAULT_NONE;
+
+        if fetch_fault {
+            fault = FAULT_FETCH;
+        } else if code == Opcode::Ebreak {
+            fault = FAULT_BREAK;
+        } else if (csr_write && csr_read_only) || (user_mode && privileged) {
+            fault = FAULT_ILLEGAL;
+        }
+    }
+}

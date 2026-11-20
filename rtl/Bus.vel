@@ -1,0 +1,330 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "Config.vel", "BRAM.vel"]
+
+enum Transaction { Idle, Execute, Read }
+enum Ownership { Idle, Snoop, Grant }
+
+module Bus(
+    clk: in clock,
+    rst: in reset,
+
+    core_sdram_request: in [bool; CORE_COUNT],
+    core_sdram_start: in [bool; CORE_COUNT],
+    core_sdram_write: in [bool; CORE_COUNT],
+    core_sdram_length: in [u3; CORE_COUNT],
+    core_sdram_address: in [u21; CORE_COUNT],
+    core_sdram_data: in [u32; CORE_COUNT],
+    core_sdram_dqm: in [u4; CORE_COUNT],
+    core_sdram_ready: out [bool; CORE_COUNT],
+    core_sdram_valid: out [bool; CORE_COUNT],
+    sdram_ready: in bool,
+    sdram_valid: in bool,
+    sdram_start: out bool,
+    sdram_write: out bool,
+    sdram_length: out u3,
+    sdram_address: out u21,
+    sdram_data: out u32,
+    sdram_dqm: out u4,
+
+    core_flash_request: in [bool; CORE_COUNT],
+    core_flash_address: in [u24; CORE_COUNT],
+    core_flash_ready: out [bool; CORE_COUNT],
+    flash_ready: in bool,
+    flash_request: out reg bool = false,
+    flash_address: out reg u24 = 0,
+
+    core_tx_request: in [bool; CORE_COUNT],
+    core_tx_address: in [u32; CORE_COUNT],
+    core_tx_write_enable: in [u4; CORE_COUNT],
+    core_tx_write_data: in [u32; CORE_COUNT],
+    core_tx_done: out reg [bool; CORE_COUNT] = false,
+    tx_result: out reg u32 = 0,
+    io_word: in u32,
+    io_source: out reg u<CORE_BITS> = 0,
+    io_index: out u8,
+    io_access: out bool,
+    io_address: out reg u32 = 0,
+    io_write_enable: out reg u4 = 0,
+    io_write_data: out reg u32 = 0,
+
+    core_fetch_request: in [bool; CORE_COUNT],
+    core_fetch_address: in [u32; CORE_COUNT],
+    core_fetch_grant: out [bool; CORE_COUNT],
+    fetch_word: out u32,
+
+    core_flush: in [bool; CORE_COUNT],
+    flush_all: out bool,
+
+    core_own_request: in [bool; CORE_COUNT],
+    core_own_line: in [u18; CORE_COUNT],
+    core_own_grant: out [bool; CORE_COUNT],
+    core_snoop_valid: out [bool; CORE_COUNT],
+    core_snoop_ack: in [bool; CORE_COUNT],
+    snoop_line: out reg u18 = 0,
+    running: in u<CORE_COUNT>
+) {
+    reg sdram_owner: u<CORE_BITS> = 0;
+    reg sdram_last: u<CORE_BITS> = 0;
+    reg flash_busy: bool = false;
+    reg flash_owner: u<CORE_BITS> = 0;
+    reg tx_state: Transaction = Transaction::Idle;
+    reg tx_last: u<CORE_BITS> = 0;
+    reg tx_io: bool = false;
+    reg fetch_last: u<CORE_BITS> = 0;
+    reg own_state: Ownership = Ownership::Idle;
+    reg own_holder: u<CORE_BITS> = 0;
+    reg own_last: u<CORE_BITS> = 0;
+    wire sdram_grant: u<CORE_BITS>;
+    wire flash_any: bool;
+    wire flash_pick: u<CORE_BITS>;
+    wire tx_any: bool;
+    wire tx_pick: u<CORE_BITS>;
+    wire fetch_any: bool;
+    wire fetch_pick: u<CORE_BITS>;
+    wire own_any: bool;
+    wire own_pick: u<CORE_BITS>;
+    wire own_acked: bool;
+
+    for i in 0..CORE_COUNT {
+        reg flash_pending: bool = false;
+        reg flash_target: u24 = 0;
+
+        core_sdram_ready[i] = sdram_ready && sdram_grant == i;
+        core_sdram_valid[i] = sdram_valid && sdram_owner == i;
+        core_flash_ready[i] = flash_ready && flash_busy && flash_owner == i;
+        core_fetch_grant[i] = core_fetch_request[i] && fetch_pick == i;
+        core_own_grant[i] = own_state == Ownership::Grant && own_holder == i;
+        core_snoop_valid[i] = own_state == Ownership::Snoop && own_holder != i && running[i];
+    }
+
+    let tx_target = core_tx_address[tx_pick];
+    let tx_finish = (tx_state == Transaction::Execute && (tx_io || io_write_enable != 0)) || tx_state == Transaction::Read;
+
+    let bram = BRAM {
+        fetch_address: core_fetch_address[fetch_pick],
+        fetch_hold: false,
+        data_address: io_address,
+        data_hold: false,
+        write: tx_state == Transaction::Execute && !tx_io && io_write_enable != 0,
+        write_address: io_address,
+        write_data: io_write_data,
+        write_mask: io_write_enable
+    };
+
+    sdram_start = core_sdram_start[sdram_grant];
+    sdram_write = core_sdram_write[sdram_grant];
+    sdram_length = core_sdram_length[sdram_grant];
+    sdram_address = core_sdram_address[sdram_grant];
+    sdram_data = core_sdram_data[sdram_grant];
+    sdram_dqm = core_sdram_dqm[sdram_grant];
+    io_access = tx_state == Transaction::Execute && tx_io;
+    io_index = io_address[7:0];
+    fetch_word = bram.fetch_word;
+
+    comb {
+        sdram_grant = 0;
+
+        for k in 0..CORE_COUNT {
+            if core_sdram_request[CORE_COUNT - 1 - k] {
+                sdram_grant = (CORE_COUNT - 1 - k) as u<CORE_BITS>;
+            }
+        }
+
+        for k in 0..CORE_COUNT {
+            if core_sdram_request[CORE_COUNT - 1 - k] && sdram_last < (CORE_COUNT - 1 - k) {
+                sdram_grant = (CORE_COUNT - 1 - k) as u<CORE_BITS>;
+            }
+        }
+    }
+
+    comb {
+        flash_any = false;
+        flash_pick = 0;
+
+        for k in 0..CORE_COUNT {
+            if flash_pending[CORE_COUNT - 1 - k] {
+                flash_any = true;
+                flash_pick = (CORE_COUNT - 1 - k) as u<CORE_BITS>;
+            }
+        }
+    }
+
+    comb {
+        tx_any = false;
+        tx_pick = 0;
+
+        for k in 0..CORE_COUNT {
+            if core_tx_request[CORE_COUNT - 1 - k] && !core_tx_done[CORE_COUNT - 1 - k] {
+                tx_any = true;
+                tx_pick = (CORE_COUNT - 1 - k) as u<CORE_BITS>;
+            }
+        }
+
+        for k in 0..CORE_COUNT {
+            if core_tx_request[CORE_COUNT - 1 - k] && !core_tx_done[CORE_COUNT - 1 - k] && tx_last < (CORE_COUNT - 1 - k) {
+                tx_pick = (CORE_COUNT - 1 - k) as u<CORE_BITS>;
+            }
+        }
+    }
+
+    comb {
+        fetch_any = false;
+        fetch_pick = 0;
+
+        for k in 0..CORE_COUNT {
+            if core_fetch_request[CORE_COUNT - 1 - k] {
+                fetch_any = true;
+                fetch_pick = (CORE_COUNT - 1 - k) as u<CORE_BITS>;
+            }
+        }
+
+        for k in 0..CORE_COUNT {
+            if core_fetch_request[CORE_COUNT - 1 - k] && fetch_last < (CORE_COUNT - 1 - k) {
+                fetch_pick = (CORE_COUNT - 1 - k) as u<CORE_BITS>;
+            }
+        }
+    }
+
+    comb {
+        own_any = false;
+        own_pick = 0;
+
+        for k in 0..CORE_COUNT {
+            if core_own_request[CORE_COUNT - 1 - k] {
+                own_any = true;
+                own_pick = (CORE_COUNT - 1 - k) as u<CORE_BITS>;
+            }
+        }
+
+        for k in 0..CORE_COUNT {
+            if core_own_request[CORE_COUNT - 1 - k] && own_last < (CORE_COUNT - 1 - k) {
+                own_pick = (CORE_COUNT - 1 - k) as u<CORE_BITS>;
+            }
+        }
+    }
+
+    comb {
+        own_acked = true;
+
+        for i in 0..CORE_COUNT {
+            if core_snoop_valid[i] && !core_snoop_ack[i] {
+                own_acked = false;
+            }
+        }
+    }
+
+    comb {
+        flush_all = false;
+
+        for i in 0..CORE_COUNT {
+            if core_flush[i] {
+                flush_all = true;
+            }
+        }
+    }
+
+    seq {
+        if sdram_start {
+            sdram_owner <- sdram_grant;
+            sdram_last <- sdram_grant;
+        }
+
+        if fetch_any {
+            fetch_last <- fetch_pick;
+        }
+
+        flash_request <- false;
+
+        for i in 0..CORE_COUNT {
+            if core_flash_request[i] {
+                flash_pending[i] <- true;
+                flash_target[i] <- core_flash_address[i];
+            }
+        }
+
+        if !flash_busy && flash_any {
+            flash_request <- true;
+            flash_address <- flash_target[flash_pick];
+            flash_owner <- flash_pick;
+            flash_busy <- true;
+
+            for i in 0..CORE_COUNT {
+                if flash_pick == i {
+                    flash_pending[i] <- false;
+                }
+            }
+        } else if flash_busy && flash_ready {
+            flash_busy <- false;
+        }
+
+        for i in 0..CORE_COUNT {
+            core_tx_done[i] <- tx_finish && io_source == i;
+        }
+
+        match own_state {
+            Ownership::Idle => {
+                if own_any {
+                    own_holder <- own_pick;
+                    own_last <- own_pick;
+                    snoop_line <- core_own_line[own_pick];
+                    own_state <- Ownership::Snoop;
+                }
+            },
+            Ownership::Snoop => {
+                if !core_own_request[own_holder] {
+                    own_state <- Ownership::Idle;
+                } else if own_acked {
+                    own_state <- Ownership::Grant;
+                }
+            },
+            Ownership::Grant => {
+                if !core_own_request[own_holder] {
+                    own_state <- Ownership::Idle;
+                }
+            }
+        }
+
+        match tx_state {
+            Transaction::Idle => {
+                if tx_any {
+                    io_source <- tx_pick;
+                    io_address <- tx_target;
+                    io_write_enable <- core_tx_write_enable[tx_pick];
+                    io_write_data <- core_tx_write_data[tx_pick];
+                    tx_io <- tx_target[31:8] == 0xFF || tx_target[31:14] == 2;
+                    tx_last <- tx_pick;
+                    tx_state <- Transaction::Execute;
+                }
+            },
+            Transaction::Execute => {
+                if tx_io {
+                    tx_result <- io_word;
+                    tx_state <- Transaction::Idle;
+                } else if io_write_enable != 0 {
+                    tx_state <- Transaction::Idle;
+                } else {
+                    tx_state <- Transaction::Read;
+                }
+            },
+            Transaction::Read => {
+                tx_result <- bram.data_word;
+                tx_state <- Transaction::Idle;
+            }
+        }
+    }
+}

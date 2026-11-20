@@ -1,0 +1,844 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "Config.vel", "Decoder.vel", "MulDiv.vel", "BranchPredictor.vel"]
+
+module Core(
+    clk: in clock,
+    rst: in reset,
+    #[if CORE_COUNT > 1]
+    core_id: in u<CORE_BITS>,
+    reset_vector: in u32,
+
+    fetch_pc: out u32,
+    fetch_redirect: out bool,
+    fetch_redirect_pc: out u32,
+    fetch_sequential_pc: out u32,
+    fetch_valid: out bool,
+    fetch_hold: out bool,
+    fetch_instruction: in u32,
+    fetch_hit: in bool,
+    fetch_fault: in bool,
+    fetch_busy: in bool,
+
+    data_address: out u32,
+    data_hold: out bool,
+    m1_access: out bool,
+    m1_address: out reg u32 = 0,
+    m1_load: out bool,
+    m1_store: out bool,
+    m1_size: out u2,
+    m1_signed: out bool,
+    m1_load_data: in u32,
+    m2_replay: in bool,
+    m2_wait: in bool,
+    data_fault: in bool,
+    data_busy: in bool,
+    m2_commit: out bool,
+    m2_retry: out bool,
+    trap_taken: out reg bool = false,
+    store_commit: out bool,
+    store_address: out u32,
+    store_data: out u32,
+    store_mask: out u4,
+
+    user_mode: out reg bool = false,
+    csr_ptbase: out reg u32 = 0,
+    csr_asid: out reg u4 = 0,
+    tlb_flush: out reg bool = false,
+    cache_flush: out reg bool = false,
+    icache_flush: out reg bool = false,
+
+    interrupt_lines: in u3,
+    #[if CORE_COUNT > 1]
+    interrupt_block: in bool,
+    #[if CORE_COUNT > 1]
+    drained: in bool,
+    #[if CORE_COUNT > 1]
+    reservation_kill: in bool,
+    cycle_counter: in u32,
+    ms_counter: in u32,
+    instret: out u32,
+    halted: out reg bool = false,
+
+    trace_retire: out reg bool = false,
+    trace_trap: out reg bool = false,
+    trace_pc: out reg u32 = 0,
+    trace_rd: out reg u5 = 0,
+    trace_value: out reg u32 = 0,
+    trace_store_address: out reg u32 = 0,
+    trace_store_data: out reg u32 = 0,
+    trace_store_mask: out reg u4 = 0,
+    trace_cause: out reg u32 = 0,
+    trace_address: out reg u32 = 0
+) {
+    reg regs: [u32; 32];
+
+    reg started: bool = false;
+    reg f1_pc: u32 = 0;
+    reg redirect_valid: bool = false;
+    reg redirect_pc: u32 = 0;
+    reg redirect_wait_fetch: bool = false;
+    reg redirect_wait_data: bool = false;
+
+    reg f2_valid: bool = false;
+    reg f2_pc: u32 = 0;
+    reg f2_next: u32 = 0;
+    reg d_next: u32 = 0;
+    reg f2_pred_taken: bool = false;
+    reg f2_pred_target: u32 = 0;
+    reg f2_pred_hit: bool = false;
+    reg f2_pred_counter: u2 = 0;
+    reg f2_pred_call: bool = false;
+    reg f2_pred_return: bool = false;
+
+    reg d_valid: bool = false;
+    reg d_miss: bool = false;
+    reg d_pc: u32 = 0;
+    reg d_instruction: u32 = 0;
+    reg d_fetch_fault: bool = false;
+    reg d_pred_taken: bool = false;
+    reg d_pred_target: u32 = 0;
+    reg d_pred_hit: bool = false;
+    reg d_pred_counter: u2 = 0;
+    reg d_pred_call: bool = false;
+    reg d_pred_return: bool = false;
+
+    reg x_valid: bool = false;
+    reg x_pc: u32 = 0;
+    reg x_next: u32 = 0;
+    reg x_instruction: u32 = 0;
+    reg x_opcode: Opcode = Opcode::Nop;
+    reg x_rd: u5 = 0;
+    reg x_writes: bool = false;
+    reg x_load: bool = false;
+    reg x_late: bool = false;
+    reg x_reg0: u32 = 0;
+    reg x_reg1: u32 = 0;
+    reg x_reg2: u32 = 0;
+    reg x_fwd_m1: u3 = 0;
+    reg x_fwd_m2: u3 = 0;
+    reg x_fwd_w: u3 = 0;
+    reg x_keep: u3 = 0;
+    reg x_offset: u32 = 0;
+    reg x_wait: u2 = 0;
+    reg x_muldiv: u3 = 0;
+    reg x_multicycle: bool = false;
+    reg x_op_add: bool = false;
+    reg x_op_sub: bool = false;
+    reg x_op_and: bool = false;
+    reg x_op_or: bool = false;
+    reg x_op_xor: bool = false;
+    reg x_op_sll: bool = false;
+    reg x_op_srl: bool = false;
+    reg x_op_sra: bool = false;
+    reg x_op_less: bool = false;
+    reg x_op_static: bool = false;
+    reg x_compare_signed: bool = false;
+    reg x_static: u32 = 0;
+    reg x_target: u32 = 0;
+    reg x_branch_always: bool = false;
+    reg x_branch_eq: bool = false;
+    reg x_branch_ne: bool = false;
+    reg x_branch_lt: bool = false;
+    reg x_branch_ge: bool = false;
+    reg x_branch_signed: bool = false;
+    reg x_jump_reg0: bool = false;
+    reg x_jump_reg1: bool = false;
+    reg x_atomic: bool = false;
+    reg x_memory_load: bool = false;
+    reg x_memory_store: bool = false;
+    reg x_size: u2 = 0;
+    reg x_load_signed: bool = false;
+    reg x_csr_op: bool = false;
+    reg x_csr_writes: bool = false;
+    reg x_csr_immediate: bool = false;
+    reg x_system: bool = false;
+    reg x_pred_taken: bool = false;
+    reg x_pred_target: u32 = 0;
+    reg x_pred_hit: bool = false;
+    reg x_pred_counter: u2 = 0;
+    reg x_target_match: bool = false;
+    reg x_fault: u3 = 0;
+
+    reg alu_active: bool = false;
+
+    reg m1_valid: bool = false;
+    reg m1_pc: u32 = 0;
+    reg m1_next: u32 = 0;
+    reg m1_instruction: u32 = 0;
+    reg m1_opcode: Opcode = Opcode::Nop;
+    reg m1_rd: u5 = 0;
+    reg m1_writes: bool = false;
+    reg m1_is_load: bool = false;
+    reg m1_late: bool = false;
+    reg m1_result: u32 = 0;
+    reg m1_store_value: u32 = 0;
+    reg m1_atomic: bool = false;
+    reg m1_memory_load: bool = false;
+    reg m1_memory_store: bool = false;
+    reg m1_size_reg: u2 = 0;
+    reg m1_load_signed: bool = false;
+    reg m1_csr_op: bool = false;
+    reg m1_csr_writes: bool = false;
+    reg m1_csr_immediate: bool = false;
+    reg m1_system: bool = false;
+    reg m1_fault: u3 = 0;
+    reg m1_branch: bool = false;
+    reg m1_always: bool = false;
+    reg m1_eq: bool = false;
+    reg m1_ne: bool = false;
+    reg m1_lt: bool = false;
+    reg m1_ge: bool = false;
+    reg m1_equal: bool = false;
+    reg m1_less: bool = false;
+    reg m1_match: bool = false;
+    reg m1_pred_taken: bool = false;
+    reg m1_destination: u32 = 0;
+    reg m1_pred_hit: bool = false;
+    reg m1_pred_counter: u2 = 0;
+    reg m1_call: bool = false;
+    reg m1_return: bool = false;
+
+    reg update_valid: bool = false;
+    reg update_pc: u32 = 0;
+    reg update_taken: bool = false;
+    reg update_target: u32 = 0;
+    reg update_call: bool = false;
+    reg update_return: bool = false;
+    reg update_hit: bool = false;
+    reg update_counter: u2 = 0;
+    reg update_return_address: u32 = 0;
+    reg update_redirect: bool = false;
+
+    reg m2_valid: bool = false;
+    reg m2_pc: u32 = 0;
+    reg m2_next: u32 = 0;
+    reg m2_instruction: u32 = 0;
+    reg m2_opcode: Opcode = Opcode::Nop;
+    reg m2_rd: u5 = 0;
+    reg m2_writes: bool = false;
+    reg m2_result: u32 = 0;
+    reg m2_address: u32 = 0;
+    reg m2_store_value: u32 = 0;
+    reg m2_size: u2 = 0;
+    reg m2_csr_source: u32 = 0;
+    reg m2_csr_value: u32 = 0;
+    reg m2_csr_instret: bool = false;
+    reg m2_csr_op: bool = false;
+    reg m2_csr_writes: bool = false;
+    reg m2_csr_target: u11 = 0;
+    reg m2_fault: u3 = 0;
+    reg m2_memory: bool = false;
+    reg m2_started: bool = false;
+    reg m2_system: bool = false;
+    reg m2_stores: bool = false;
+
+    reg w_valid: bool = false;
+    reg w_retired: bool = false;
+    reg w_rd: u5 = 0;
+    reg w_value: u32 = 0;
+
+    reg late_valid: bool = false;
+    reg late_pc: u32 = 0;
+    reg late_wait_fetch: bool = false;
+    reg late_wait_data: bool = false;
+
+    reg interrupt_pending: bool = false;
+    reg pending_lines: u3 = 0;
+    reg wfi_block: bool = false;
+
+    reg csr_ie: bool = false;
+    reg csr_pie: bool = false;
+    reg csr_pu: bool = false;
+    reg csr_ienable: u32 = 0;
+    reg csr_epc: u32 = 0;
+    reg csr_cause: u32 = 0;
+    reg csr_vector: u32 = 0;
+    reg csr_scratch: u32 = 0;
+    reg csr_badaddr: u32 = 0;
+    reg instret_counter: u32 = 0;
+
+    reg reservation_valid: bool = false;
+    reg reservation_address: u32 = 0;
+
+    wire csr_read: u32;
+    wire csr_write: u32;
+    wire atomic_value: u32;
+
+    let hold_x = x_valid && (x_wait != 0 || (x_multicycle && !(alu_active && muldiv.ready)));
+    let m2_go = m2_valid && !late_valid;
+    let m2_wfi = m2_opcode == Opcode::Wfi;
+    let hold_m2 = m2_go && (m2_wait || (m2_wfi && wfi_block) || (CORE_COUNT > 1 && m2_opcode == Opcode::Fence && !drained));
+    let d_advance = !hold_x && !hold_m2;
+
+    let f1_current = if redirect_valid { redirect_pc } else { f1_pc };
+    let f1_next = f1_current + 4;
+    let fetch_allowed = started && !halted && !(redirect_valid && ((redirect_wait_fetch && fetch_busy) || (redirect_wait_data && data_busy)));
+    let f1_advance = fetch_allowed && d_advance;
+
+    let decode = Decoder {
+        instruction: d_instruction,
+        pc: d_pc,
+        next: d_next,
+        user_mode,
+        fetch_fault: d_fetch_fault
+    };
+
+    let predicted = predictor.predict_taken && !redirect_valid;
+    let d_live = d_valid && !d_miss;
+    let d_link = decode.opcode == Opcode::Bl && d_rs0 == 1;
+    let d_call = d_pred_call || (d_jump && d_link);
+
+    let predictor = BranchPredictor {
+        fetch_pc: f1_pc,
+        push: d_advance && d_live && d_call,
+        pop: d_advance && d_live && d_pred_return,
+        push_address: d_next,
+        bypass_near: f2_valid && f2_pred_call,
+        near_address: f2_next,
+        bypass_far: d_live && d_pred_call && !(f2_valid && f2_pred_return),
+        far_address: d_next,
+        return_offset: if d_live && d_pred_call { 0 as u2 } else { ((d_live && d_pred_return) as u2) + ((f2_valid && f2_pred_return) as u2) },
+        redirect: update_redirect,
+        update: update_valid,
+        update_pc,
+        update_taken,
+        update_target,
+        update_call,
+        update_return,
+        update_hit,
+        update_counter,
+        return_address: update_return_address
+    };
+    let d_rs0 = decode.rs0;
+    let d_rs1 = decode.rs1;
+    let d_rs2 = decode.rs2;
+    let d_from_x: u3 = if x_valid && x_writes && x_rd != 0 { cat(d_rs2 == x_rd, d_rs1 == x_rd, d_rs0 == x_rd) } else { 0 };
+    let d_from_m1: u3 = if m1_valid && m1_writes && m1_rd != 0 { cat(d_rs2 == m1_rd, d_rs1 == m1_rd, d_rs0 == m1_rd) } else { 0 };
+    let d_from_m2: u3 = if m2_valid && m2_writes && m2_rd != 0 { cat(d_rs2 == m2_rd, d_rs1 == m2_rd, d_rs0 == m2_rd) } else { 0 };
+    let d_fwd_m1 = d_from_x & decode.reads;
+    let d_fwd_m2 = d_from_m1 & !d_from_x & decode.reads;
+    let d_fwd_w = d_from_m2 & !d_from_x & !d_from_m1 & decode.reads;
+    let d_wait_two = x_late && (d_from_x & decode.reads) != 0;
+    let d_wait_one = (x_load && (d_from_x & decode.reads) != 0) || (m1_late && (d_from_m1 & decode.reads) != 0);
+    let d_reg0 = if w_valid && w_rd != 0 && w_rd == d_rs0 { w_value } else { regs[d_rs0] };
+    let d_reg1 = if w_valid && w_rd != 0 && w_rd == d_rs1 { w_value } else { regs[d_rs1] };
+    let d_reg2 = if w_valid && w_rd != 0 && w_rd == d_rs2 { w_value } else { regs[d_rs2] };
+    let d_jump = d_valid && !d_miss && !d_pred_taken && decode.direct;
+
+    let x_reg0_fwd = (m1_result & rep(32, x_fwd_m1[0])) | (m2_result & rep(32, x_fwd_m2[0])) | (w_value & rep(32, x_fwd_w[0])) | (x_reg0 & rep(32, x_keep[0]));
+    let x_reg1_fwd = (m1_result & rep(32, x_fwd_m1[1])) | (m2_result & rep(32, x_fwd_m2[1])) | (w_value & rep(32, x_fwd_w[1])) | (x_reg1 & rep(32, x_keep[1]));
+    let x_reg2_fwd = (m1_result & rep(32, x_fwd_m1[2])) | (m2_result & rep(32, x_fwd_m2[2])) | (w_value & rep(32, x_fwd_w[2])) | (x_reg2 & rep(32, x_keep[2]));
+    let alu_left = x_reg1_fwd;
+    let alu_right = x_reg2_fwd;
+    let alu_start = x_valid && x_multicycle && !alu_active && x_wait == 0;
+
+    let muldiv = MulDiv {
+        left: alu_left,
+        right: alu_right,
+        op: x_muldiv,
+        start: alu_start
+    };
+
+    let compare_less = (cat(x_compare_signed && alu_left[31], alu_left) as i33) < (cat(x_compare_signed && alu_right[31], alu_right) as i33);
+    let x_sum = alu_left + alu_right;
+    let x_difference = alu_left - alu_right;
+    let x_rest = (rep(32, x_op_and) & (alu_left & alu_right)) | (rep(32, x_op_or) & (alu_left | alu_right)) | (rep(32, x_op_xor) & (alu_left ^ alu_right)) |
+        (rep(32, x_op_static) & x_static) | (rep(32, x_multicycle) & muldiv.result) | ((x_op_less && compare_less) as u32);
+    let x_shift = (rep(32, x_op_sll) & (alu_left << alu_right[4:0])) | (rep(32, x_op_srl) & (alu_left >> alu_right[4:0])) |
+        (rep(32, x_op_sra) & (((alu_left as i32) >> alu_right[4:0]) as u32));
+    let x_other = x_rest | x_shift;
+    let x_result = if x_op_add { x_sum } else if x_op_sub { x_difference } else { x_other };
+    let x_address = x_reg1_fwd + x_offset;
+    let x_branch = x_branch_always || x_branch_eq || x_branch_ne || x_branch_lt || x_branch_ge;
+    let x_destination = if x_jump_reg0 { x_reg0_fwd } else if x_jump_reg1 { x_reg1_fwd } else { x_target };
+    let x_store_value = if x_opcode == Opcode::Sc || x_opcode == Opcode::Amo { x_reg2_fwd } else { x_reg0_fwd };
+
+    let m1_taken = m1_always || (m1_eq && m1_equal) || (m1_ne && !m1_equal) || (m1_lt && m1_less) || (m1_ge && !m1_less);
+    let x_match = if x_jump_reg0 { x_reg0_fwd == x_pred_target } else if x_jump_reg1 { x_reg1_fwd == x_pred_target } else { x_target_match };
+    let m1_mispredict = m1_valid && m1_branch && (if m1_pred_taken { !(m1_taken && m1_match) } else { m1_taken });
+    let m1_user_fault = user_mode && m1_address[31:30] != 3;
+    let m1_memory = m1_memory_load || m1_memory_store || m1_atomic;
+    let m1_csr = m1_instruction[15:0];
+    let m2_csr = m2_instruction[15:0];
+    let m1_csr_bypass = m2_valid && m2_csr_writes && m2_csr == m1_csr;
+
+    let interrupts = interrupt_lines & csr_ienable[2:0];
+    let take_interrupt = m2_go && !m2_started && interrupt_pending && (CORE_COUNT == 1 || !interrupt_block);
+    let take_exception = m2_go && !take_interrupt && (m2_fault != FAULT_NONE || (m2_memory && data_fault));
+    let commit = m2_go && !hold_m2 && !take_interrupt && !take_exception;
+    let m2_replayed = commit && m2_memory && m2_replay;
+    let m2_done = commit && !(m2_memory && m2_replay);
+    let m2_ecall = m2_opcode == Opcode::Ecall;
+    let m2_eret = m2_opcode == Opcode::Eret;
+    let m2_fence_i = m2_opcode == Opcode::Fence && m2_instruction[0];
+    let m2_sc = m2_opcode == Opcode::Sc;
+    let m2_redirect = take_interrupt || take_exception || (commit && m2_system);
+    let m2_redirect_pc = if take_interrupt || take_exception || m2_ecall { csr_vector } else if m2_eret { csr_epc } else { m2_next };
+    let sc_success = reservation_valid && reservation_address[31:2] == m2_address[31:2];
+    let m2_cached_region = m2_address[30];
+    let store_byte = m2_store_value[7:0];
+    let store_half = m2_store_value[15:0];
+    let m2_store_mask: u4 = if m2_size == 0 { (1 as u4) << m2_address[1:0] } else if m2_size == 1 { (3 as u4) << cat(m2_address[1], false) } else { 0xF };
+    let m2_store_data: u32 = if m2_size == 0 { rep(4, store_byte) } else if m2_size == 1 { rep(2, store_half) } else if m2_opcode == Opcode::Amo { atomic_value } else { m2_store_value };
+    let m2_store_now = m2_done && (m2_stores && (!m2_sc || sc_success));
+    let instret_now = instret_counter + (w_retired as u32);
+    let commit_value: u32 = if m2_csr_op { if m2_csr_instret { instret_now } else { m2_csr_value } } else if m2_sc { (!sc_success) as u32 } else { m2_result };
+    let interrupt_cause: u32 = if pending_lines[0] { 0x80000000 } else if pending_lines[1] { 0x80000001 } else { 0x80000002 };
+    let exception_cause: u32 = if m2_fault == FAULT_FETCH { 1 } else if m2_fault == FAULT_BREAK { 3 } else if m2_fault == FAULT_ILLEGAL { 2 } else if m2_stores { 7 } else { 5 };
+    let exception_address: u32 = if m2_fault == FAULT_FETCH || m2_fault == FAULT_BREAK { m2_pc } else if m2_fault == FAULT_ILLEGAL { m2_instruction } else { m2_address };
+
+    fetch_pc = f1_current;
+    fetch_redirect = redirect_valid;
+    fetch_redirect_pc = redirect_pc;
+    fetch_sequential_pc = f1_pc;
+    fetch_valid = fetch_allowed;
+    fetch_hold = !d_advance;
+    data_address = x_address;
+    data_hold = hold_m2;
+    m1_access = m1_valid && m1_fault == FAULT_NONE && m1_memory && !m1_user_fault;
+    m1_load = m1_memory_load || m1_atomic;
+    m1_store = m1_memory_store || m1_opcode == Opcode::Sc || m1_opcode == Opcode::Amo;
+    m1_size = m1_size_reg;
+    m1_signed = m1_load_signed;
+    m2_commit = m2_done && m2_memory;
+    m2_retry = m2_replayed;
+    store_commit = m2_store_now;
+    store_address = m2_address;
+    store_data = m2_store_data;
+    store_mask = m2_store_mask;
+    instret = instret_counter;
+
+    comb {
+        csr_read = 0;
+
+        match m1_csr {
+            CSR_STATUS => csr_read = cat(0 as u29, csr_pu, csr_pie, csr_ie),
+            CSR_IENABLE => csr_read = csr_ienable,
+            CSR_IPENDING => csr_read = interrupt_lines as u32,
+            CSR_EPC => csr_read = csr_epc,
+            CSR_CAUSE => csr_read = csr_cause,
+            CSR_VECTOR => csr_read = csr_vector,
+            CSR_SCRATCH => csr_read = csr_scratch,
+            CSR_BADADDR => csr_read = csr_badaddr,
+            CSR_PTBASE => csr_read = csr_ptbase,
+            CSR_ASID => csr_read = csr_asid as u32,
+            CSR_CYCLE => csr_read = cycle_counter,
+            CSR_TIME => csr_read = ms_counter,
+            _ => {}
+        }
+
+        if CORE_COUNT > 1 {
+            if m1_csr == CSR_COREID {
+                csr_read = core_id as u32;
+            }
+        }
+    }
+
+    comb {
+        csr_write = m2_csr_source;
+
+        match m2_opcode {
+            Opcode::Csrrs | Opcode::Csrrsi => csr_write = m2_csr_value | m2_csr_source,
+            Opcode::Csrrc | Opcode::Csrrci => csr_write = m2_csr_value & !m2_csr_source,
+            _ => {}
+        }
+    }
+
+    comb {
+        atomic_value = m2_store_value;
+
+        match m2_instruction[6:3] {
+            1 => atomic_value = m2_result + m2_store_value,
+            2 => atomic_value = m2_result ^ m2_store_value,
+            3 => atomic_value = m2_result & m2_store_value,
+            4 => atomic_value = m2_result | m2_store_value,
+            5 => atomic_value = if (m2_result as i32) < (m2_store_value as i32) { m2_result } else { m2_store_value },
+            6 => atomic_value = if (m2_result as i32) > (m2_store_value as i32) { m2_result } else { m2_store_value },
+            7 => atomic_value = if m2_result < m2_store_value { m2_result } else { m2_store_value },
+            8 => atomic_value = if m2_result > m2_store_value { m2_result } else { m2_store_value },
+            _ => {}
+        }
+    }
+
+    seq(clk) {
+        if rst {
+            for i in 0..32 {
+                regs[i] <- 0;
+            }
+        } else if w_valid && w_rd != 0 {
+            regs[w_rd] <- w_value;
+        }
+    }
+
+    seq {
+        tlb_flush <- false;
+        cache_flush <- false;
+        icache_flush <- false;
+        trap_taken <- take_interrupt || take_exception || (commit && (m2_ecall || m2_eret));
+
+        if w_retired {
+            instret_counter <- instret_counter + 1;
+        }
+
+        pending_lines <- interrupts;
+        interrupt_pending <- csr_ie && interrupts != 0 && !(commit && m2_csr_writes);
+        wfi_block <- csr_ienable[2:0] != 0 && interrupts == 0;
+
+        if !started {
+            started <- true;
+            f1_pc <- reset_vector;
+        } else if f1_advance {
+            f1_pc <- if predicted { predictor.predict_target } else { f1_next };
+            redirect_valid <- false;
+        }
+
+        update_valid <- false;
+        update_redirect <- false;
+
+        if d_advance {
+            f2_valid <- f1_advance;
+            f2_pc <- f1_current;
+            f2_next <- f1_next;
+            d_next <- f2_next;
+            f2_pred_taken <- predicted;
+            f2_pred_target <- predictor.predict_target;
+            f2_pred_hit <- predictor.predict_hit && !redirect_valid;
+            f2_pred_counter <- predictor.predict_counter;
+            f2_pred_call <- predicted && predictor.predict_call;
+            f2_pred_return <- predicted && predictor.predict_return;
+            d_pred_taken <- f2_pred_taken;
+            d_pred_target <- f2_pred_target;
+            d_pred_hit <- f2_pred_hit;
+            d_pred_counter <- f2_pred_counter;
+            d_pred_call <- f2_pred_call;
+            d_pred_return <- f2_pred_return;
+
+            d_valid <- f2_valid;
+            d_miss <- !fetch_hit && !fetch_fault;
+            d_pc <- f2_pc;
+            d_instruction <- if fetch_fault { 0 } else { fetch_instruction };
+            d_fetch_fault <- fetch_fault;
+
+            x_valid <- d_valid && !d_miss;
+            x_pc <- d_pc;
+            x_next <- d_next;
+            x_instruction <- d_instruction;
+            x_opcode <- decode.opcode;
+            x_rd <- d_rs0;
+            x_writes <- decode.writes;
+            x_load <- decode.load;
+            x_late <- decode.late;
+            x_reg0 <- d_reg0;
+            x_reg1 <- d_reg1;
+            x_reg2 <- if decode.use_imm { decode.imm } else { d_reg2 };
+            x_fwd_m1 <- d_fwd_m1;
+            x_fwd_m2 <- d_fwd_m2;
+            x_fwd_w <- d_fwd_w;
+            x_keep <- !(d_fwd_m1 | d_fwd_m2 | d_fwd_w);
+            x_offset <- decode.offset;
+            x_wait <- if d_wait_two { 2 } else if d_wait_one { 1 } else { 0 };
+            x_muldiv <- decode.muldiv;
+            x_multicycle <- d_valid && !d_miss && decode.multicycle;
+            x_op_add <- decode.op_add;
+            x_op_sub <- decode.op_sub;
+            x_op_and <- decode.op_and;
+            x_op_or <- decode.op_or;
+            x_op_xor <- decode.op_xor;
+            x_op_sll <- decode.op_sll;
+            x_op_srl <- decode.op_srl;
+            x_op_sra <- decode.op_sra;
+            x_op_less <- decode.op_less;
+            x_op_static <- decode.op_static;
+            x_compare_signed <- decode.compare_signed;
+            x_static <- decode.static_value;
+            x_target <- decode.target;
+            x_branch_always <- decode.branch_always;
+            x_branch_eq <- decode.branch_eq;
+            x_branch_ne <- decode.branch_ne;
+            x_branch_lt <- decode.branch_lt;
+            x_branch_ge <- decode.branch_ge;
+            x_branch_signed <- decode.branch_signed;
+            x_jump_reg0 <- decode.jump_reg0;
+            x_jump_reg1 <- decode.jump_reg1;
+            x_atomic <- decode.atomic;
+            x_memory_load <- decode.memory_load;
+            x_memory_store <- decode.memory_store;
+            x_size <- decode.size;
+            x_load_signed <- decode.load_signed;
+            x_csr_op <- decode.csr_op;
+            x_csr_writes <- decode.csr_writes;
+            x_csr_immediate <- decode.csr_immediate;
+            x_system <- decode.system;
+            x_pred_taken <- d_pred_taken || d_jump;
+            x_pred_target <- if d_jump { decode.target } else { d_pred_target };
+            x_pred_hit <- d_pred_hit;
+            x_pred_counter <- d_pred_counter;
+            x_target_match <- d_jump || decode.target == d_pred_target;
+            x_fault <- decode.fault;
+
+            if d_jump {
+                redirect_valid <- true;
+                redirect_pc <- decode.target;
+                redirect_wait_fetch <- false;
+                redirect_wait_data <- false;
+                f2_valid <- false;
+                d_valid <- false;
+            }
+
+            if d_valid && d_miss {
+                redirect_valid <- true;
+                redirect_pc <- d_pc;
+                redirect_wait_fetch <- true;
+                redirect_wait_data <- false;
+                f2_valid <- false;
+                d_valid <- false;
+            }
+        } else if !hold_m2 {
+            if x_fwd_w[0] { x_reg0 <- w_value; }
+            if x_fwd_w[1] { x_reg1 <- w_value; }
+            if x_fwd_w[2] { x_reg2 <- w_value; }
+
+            x_fwd_w <- x_fwd_m2;
+            x_fwd_m2 <- x_fwd_m1;
+            x_fwd_m1 <- 0;
+            x_keep <- x_keep | x_fwd_w;
+
+            if x_wait != 0 {
+                x_wait <- x_wait - 1;
+            }
+        }
+
+        if alu_start {
+            alu_active <- true;
+        } else if muldiv.ready && d_advance {
+            alu_active <- false;
+        }
+
+        if !hold_m2 {
+            m1_valid <- x_valid && !hold_x;
+            m1_pc <- x_pc;
+            m1_next <- x_next;
+            m1_instruction <- x_instruction;
+            m1_opcode <- x_opcode;
+            m1_rd <- x_rd;
+            m1_writes <- x_writes;
+            m1_is_load <- x_load;
+            m1_late <- x_late;
+            m1_result <- x_result;
+            m1_address <- x_address;
+            m1_store_value <- x_store_value;
+            m1_atomic <- x_atomic;
+            m1_memory_load <- x_memory_load;
+            m1_memory_store <- x_memory_store;
+            m1_size_reg <- x_size;
+            m1_load_signed <- x_load_signed;
+            m1_csr_op <- x_csr_op;
+            m1_csr_writes <- x_csr_writes;
+            m1_csr_immediate <- x_csr_immediate;
+            m1_system <- x_system;
+            m1_fault <- x_fault;
+            m1_branch <- (x_branch || x_pred_taken) && x_fault == FAULT_NONE;
+            m1_always <- x_branch_always;
+            m1_eq <- x_branch_eq;
+            m1_ne <- x_branch_ne;
+            m1_lt <- x_branch_lt;
+            m1_ge <- x_branch_ge;
+            m1_equal <- x_reg0_fwd == x_reg1_fwd;
+            m1_less <- (cat(x_branch_signed && x_reg0_fwd[31], x_reg0_fwd) as i33) < (cat(x_branch_signed && x_reg1_fwd[31], x_reg1_fwd) as i33);
+            m1_match <- x_match;
+            m1_pred_taken <- x_pred_taken;
+            m1_destination <- x_destination;
+            m1_pred_hit <- x_pred_hit;
+            m1_pred_counter <- x_pred_counter;
+            m1_call <- (x_opcode == Opcode::Bl || x_opcode == Opcode::Blr) && x_rd == 1;
+            m1_return <- x_jump_reg0 && x_rd == 1;
+
+            if m1_valid && m1_branch {
+                update_valid <- true;
+                update_pc <- m1_pc;
+                update_taken <- m1_taken;
+                update_target <- m1_destination;
+                update_call <- m1_call;
+                update_return <- m1_return;
+                update_hit <- m1_pred_hit;
+                update_counter <- m1_pred_counter;
+                update_return_address <- m1_next;
+                update_redirect <- m1_mispredict;
+            }
+
+            if m1_mispredict {
+                redirect_valid <- true;
+                redirect_pc <- if m1_taken { m1_destination } else { m1_next };
+                redirect_wait_fetch <- false;
+                redirect_wait_data <- false;
+                f2_valid <- false;
+                d_valid <- false;
+                x_valid <- false;
+                x_multicycle <- false;
+                alu_active <- false;
+                m1_valid <- false;
+            }
+
+            m2_valid <- m1_valid;
+            m2_pc <- m1_pc;
+            m2_next <- m1_next;
+            m2_instruction <- m1_instruction;
+            m2_opcode <- m1_opcode;
+            m2_rd <- m1_rd;
+            m2_writes <- m1_writes;
+            m2_result <- if m1_is_load { m1_load_data } else { m1_result };
+            m2_address <- m1_address;
+            m2_store_value <- m1_store_value;
+            m2_size <- m1_size_reg;
+            m2_csr_source <- if m1_csr_immediate { m1_instruction[20:16] as u32 } else { m1_result };
+            m2_csr_value <- if m1_csr_bypass { csr_write } else { csr_read };
+            m2_csr_instret <- m1_csr == CSR_INSTRET;
+            m2_csr_op <- m1_csr_op;
+            m2_csr_writes <- m1_csr_writes;
+            m2_fault <- if m1_fault == FAULT_NONE && m1_memory && m1_user_fault { FAULT_DATA } else { m1_fault };
+            m2_memory <- m1_access;
+            m2_started <- false;
+            m2_system <- m1_system;
+            m2_stores <- m1_memory_store || m1_opcode == Opcode::Sc || m1_opcode == Opcode::Amo;
+
+            for c in 0..11 {
+                m2_csr_target[c] <- m1_csr_writes && m1_csr == c;
+            }
+        } else {
+            m2_started <- true;
+        }
+
+        w_valid <- m2_done && m2_writes;
+        w_retired <- m2_done;
+
+        if commit {
+            w_rd <- m2_rd;
+            w_value <- commit_value;
+        }
+
+        trace_retire <- m2_done && !m2_ecall;
+        trace_trap <- take_interrupt || take_exception || (m2_done && m2_ecall);
+        trace_pc <- if m2_done && m2_ecall { m2_next } else { m2_pc };
+        trace_rd <- if m2_writes { m2_rd } else { 0 };
+        trace_value <- commit_value;
+        trace_store_address <- m2_address;
+        trace_store_data <- m2_store_data;
+        trace_store_mask <- if m2_store_now { m2_store_mask } else { 0 };
+        trace_cause <- if take_interrupt { interrupt_cause } else if take_exception { exception_cause } else { 8 };
+        trace_address <- if take_exception { exception_address } else { 0 };
+
+        if commit && m2_opcode == Opcode::Hlt {
+            halted <- true;
+        }
+
+        if m2_done {
+            if m2_opcode == Opcode::Lr {
+                reservation_valid <- true;
+                reservation_address <- m2_address;
+            } else if m2_sc {
+                reservation_valid <- false;
+            } else if m2_store_now && m2_cached_region && m2_address[31:2] == reservation_address[31:2] {
+                reservation_valid <- false;
+            }
+        }
+
+        late_valid <- m2_redirect || m2_replayed;
+        late_pc <- if m2_replayed { m2_pc } else { m2_redirect_pc };
+        late_wait_fetch <- commit && m2_system;
+        late_wait_data <- m2_replayed || (commit && m2_fence_i);
+
+        if late_valid {
+            redirect_valid <- true;
+            redirect_pc <- late_pc;
+            redirect_wait_fetch <- late_wait_fetch;
+            redirect_wait_data <- late_wait_data;
+            f2_valid <- false;
+            d_valid <- false;
+            x_valid <- false;
+            x_multicycle <- false;
+            alu_active <- false;
+            m1_valid <- false;
+            m2_valid <- false;
+            update_valid <- false;
+            update_redirect <- true;
+        }
+
+        if take_interrupt {
+            csr_epc <- m2_pc;
+            csr_cause <- interrupt_cause;
+            csr_pie <- csr_ie;
+            csr_ie <- false;
+            csr_pu <- user_mode;
+            user_mode <- false;
+            reservation_valid <- false;
+        } else if take_exception {
+            csr_epc <- m2_pc;
+            csr_cause <- exception_cause;
+            csr_badaddr <- exception_address;
+            csr_pie <- csr_ie;
+            csr_ie <- false;
+            csr_pu <- user_mode;
+            user_mode <- false;
+            reservation_valid <- false;
+        } else if commit {
+            if m2_ecall {
+                csr_epc <- m2_next;
+                csr_cause <- 8;
+                csr_pie <- csr_ie;
+                csr_ie <- false;
+                csr_pu <- user_mode;
+                user_mode <- false;
+                reservation_valid <- false;
+            } else if m2_eret {
+                csr_ie <- csr_pie;
+                csr_pie <- true;
+                user_mode <- csr_pu;
+                csr_pu <- false;
+                reservation_valid <- false;
+            } else if m2_fence_i {
+                icache_flush <- true;
+            } else {
+                if m2_csr_target[0] {
+                    csr_ie <- csr_write[0];
+                    csr_pie <- csr_write[1];
+                    csr_pu <- csr_write[2];
+                }
+
+                if m2_csr_target[1] { csr_ienable <- csr_write; }
+                if m2_csr_target[3] { csr_epc <- csr_write; }
+                if m2_csr_target[4] { csr_cause <- csr_write; }
+                if m2_csr_target[5] { csr_vector <- csr_write; }
+                if m2_csr_target[6] { csr_scratch <- csr_write; }
+                if m2_csr_target[7] { csr_badaddr <- csr_write; }
+                if m2_csr_target[8] { csr_ptbase <- csr_write; }
+                if m2_csr_target[9] { csr_asid <- csr_write[3:0]; }
+
+                if m2_csr_target[10] {
+                    tlb_flush <- true;
+                    cache_flush <- csr_write[0];
+                }
+            }
+        }
+
+        if CORE_COUNT > 1 {
+            if reservation_kill {
+                reservation_valid <- false;
+            }
+        }
+    }
+}

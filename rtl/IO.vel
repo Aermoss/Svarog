@@ -1,0 +1,211 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#[include "Config.vel", "UART.vel", "SPI.vel", "WS2812.vel"]
+
+const IO_UART_DATA: u32 = 0xFFFF;
+const IO_UART_STATUS: u32 = 0xFFFC;
+const IO_UART_DIVISOR: u32 = 0xFFF8;
+const IO_BUTTON: u32 = 0xFFF4;
+const IO_LEDS: u32 = 0xFFF0;
+const IO_MILLISECONDS: u32 = 0xFFEC;
+const IO_CYCLES: u32 = 0xFFE8;
+const IO_INSTRUCTIONS: u32 = 0xFFE4;
+const IO_WS2812: u32 = 0xFFE0;
+const IO_TIMER_COMPARE: u32 = 0xFFDC;
+const IO_VIDEO_CURSOR: u32 = 0xFFD0;
+const IO_VIDEO_SCROLL: u32 = 0xFFCC;
+const IO_SPI_DATA: u32 = 0xFFB8;
+const IO_SPI_CONTROL: u32 = 0xFFB4;
+const IO_SPI_DIVISOR: u32 = 0xFFB0;
+const IO_IPI_SEND: u32 = 0xFFA8;
+const IO_IPI_CLEAR: u32 = 0xFFA4;
+const IO_CORE_START: u32 = 0xFFA0;
+const TICK_MAX: u17 = 80999;
+
+module IO(
+    clk: in clock,
+    rst: in reset,
+    fast: in bool,
+
+    #[if CORE_COUNT > 1]
+    source: in u<CORE_BITS>,
+    read_index: in u8,
+    read_word: out u32,
+
+    access: in bool,
+    address: in u32,
+    write_enable: in u4,
+    write_data: in u32,
+    instret: in [u32; CORE_COUNT],
+
+    interrupts: out reg [u3; CORE_COUNT] = 0,
+    #[if CORE_COUNT > 1]
+    running: out reg u<CORE_COUNT> = 1,
+    #[if CORE_COUNT > 1]
+    start_address: out reg u32 = 0,
+    cycle_counter: out reg u32 = 0,
+    ms_counter: out reg u32 = 0,
+
+    uart_rx: in bool,
+    uart_tx: out bool,
+    sd_clk: out bool,
+    sd_mosi: out bool,
+    sd_miso: in bool,
+    sd_cs_n: out bool,
+    button: in bool,
+    leds: out reg u6 = 0x3F,
+    ws2812: out bool,
+    video_write: out bool,
+    video_address: out u12,
+    video_data: out u16,
+    video_cursor: out reg u16 = 0,
+    video_scroll: out reg u5 = 0
+) {
+    reg tick: u17 = 0;
+
+    for i in 0..CORE_COUNT {
+        reg timer_compare: u32 = 0;
+        reg timer_pending: bool = false;
+        reg ipi_pending: bool = false;
+    }
+
+    reg spinlocks: u8 = 0;
+    reg button_sync0: bool = false;
+    reg button_sync1: bool = false;
+    wire read_value: u32;
+
+    let io_write = access && write_enable != 0;
+    let io_read = access && write_enable == 0;
+    let spinlock = address[31:5] == 0x7FC && address[1:0] == 0;
+    let lane_byte = if write_enable[3] { write_data[31:24] } else if write_enable[2] { write_data[23:16] } else if write_enable[1] { write_data[15:8] } else { write_data[7:0] };
+    let console_write = address == IO_UART_DATA && io_write;
+    let console_byte = lane_byte;
+
+    let uart = UART {
+        fast,
+        write: console_write,
+        write_data: lane_byte,
+        read: address == IO_UART_DATA && io_read,
+        divisor_write: address == IO_UART_DIVISOR && io_write,
+        divisor_data: write_data[15:0],
+        rx_pin: uart_rx
+    };
+
+    let sd = SPI {
+        data_write: address == IO_SPI_DATA && io_write,
+        write_data: write_data[7:0],
+        control_write: address == IO_SPI_CONTROL && io_write,
+        control_data: write_data[4:0],
+        divisor_write: address == IO_SPI_DIVISOR && io_write,
+        divisor_data: write_data[7:0],
+        miso: sd_miso
+    };
+
+    let _ws2812 = WS2812 {
+        strobe: address == IO_WS2812 && io_write,
+        write: write_data[23:0]
+    };
+
+    read_word = read_value;
+    uart_tx = uart.tx_pin;
+    sd_clk = sd.sclk;
+    sd_mosi = sd.mosi;
+    sd_cs_n = sd.cs_n;
+    ws2812 = _ws2812.out_pin;
+    video_write = address[31:14] == 2 && io_write;
+    video_address = address[13:2];
+    video_data = write_data[15:0];
+
+    comb {
+        read_value = 0;
+
+        match read_index {
+            0xFF => read_value = rep(4, uart.read_data),
+            0xFC => read_value = cat(0 as u30, uart.tx_busy, uart.rx_ready),
+            0xF8 => read_value = uart.divisor as u32,
+            0xF4 => read_value = button_sync1 as u32,
+            0xEC => read_value = ms_counter,
+            0xE8 => read_value = cycle_counter,
+            0xE4 => read_value = if CORE_COUNT > 1 { instret[source] } else { instret[0] },
+            0xDC => read_value = if CORE_COUNT > 1 { timer_compare[source] } else { timer_compare[0] },
+            0xD0 => read_value = video_cursor as u32,
+            0xCC => read_value = video_scroll as u32,
+            0xB8 => read_value = sd.read_data as u32,
+            0xB4 => read_value = sd.status as u32,
+            0xB0 => read_value = sd.divisor as u32,
+            0xA8 => read_value = (if CORE_COUNT > 1 { ipi_pending[source] } else { ipi_pending[0] }) as u32,
+            0xA0 => read_value = CORE_COUNT,
+            0x80 | 0x84 | 0x88 | 0x8C | 0x90 | 0x94 | 0x98 | 0x9C => read_value = (!spinlocks[read_index[4:2]]) as u32,
+            _ => {}
+        }
+    }
+
+    seq {
+        if tick >= TICK_MAX {
+            tick <- 0;
+            ms_counter <- ms_counter + 1;
+        } else {
+            tick <- tick + 1;
+        }
+
+        cycle_counter <- cycle_counter + 1;
+
+        for i in 0..CORE_COUNT {
+            if io_write && address == IO_TIMER_COMPARE && (CORE_COUNT == 1 || source == i) {
+                timer_compare[i] <- write_data;
+            }
+
+            timer_pending[i] <- ((cycle_counter - timer_compare[i]) as i32) >= 0;
+
+            if io_write && address == IO_IPI_CLEAR && (CORE_COUNT == 1 || source == i) {
+                ipi_pending[i] <- false;
+            }
+
+            if io_write && address == IO_IPI_SEND {
+                ipi_pending[i] <- ipi_pending[i] || write_data[i];
+            }
+
+            interrupts[i] <- cat(ipi_pending[i], if i == 0 { uart.rx_ready } else { false }, timer_pending[i]);
+        }
+
+        if CORE_COUNT > 1 {
+            if io_write && address == IO_CORE_START {
+                start_address <- write_data;
+                running <- (1 << CORE_COUNT) - 1;
+            }
+        }
+
+        if spinlock && io_write {
+            spinlocks[address[4:2]] <- false;
+        } else if spinlock && io_read {
+            spinlocks[address[4:2]] <- true;
+        }
+
+        button_sync0 <- button;
+        button_sync1 <- button_sync0;
+
+        if address == IO_LEDS && io_write {
+            leds <- write_data[5:0];
+        }
+
+        if address == IO_VIDEO_CURSOR && io_write {
+            video_cursor <- write_data[15:0];
+        } else if address == IO_VIDEO_SCROLL && io_write {
+            video_scroll <- write_data[4:0];
+        }
+    }
+}

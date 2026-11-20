@@ -1,0 +1,92 @@
+/*
+ * Copyright 2026 Yusuf Rençber
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+enum FlashState { Idle, Transfer, Done }
+
+module Flash(
+    clk: in clock,
+    rst: in reset,
+    request: in bool,
+    address: in u24,
+    read_data: out reg u32 = 0,
+    ready: out reg bool = false,
+    flash_cs: out reg bool = true,
+    flash_sck: out bool,
+    flash_mosi: out bool,
+    flash_miso: in bool
+) {
+    reg state: FlashState = FlashState::Idle;
+    reg count: u6 = 0;
+    reg phase: bool = false;
+    reg stage: bool = false;
+    reg tick: bool = false;
+    reg transmit: u32 = 0;
+    reg receive: u32 = 0;
+
+    flash_sck = !flash_cs && phase;
+    flash_mosi = transmit[31];
+
+    seq {
+        match state {
+            FlashState::Idle => {
+                ready <- false;
+
+                if request {
+                    flash_cs <- false;
+                    transmit <- cat(0x03 as u8, address);
+                    count <- 32;
+                    phase <- false;
+                    stage <- false;
+                    tick <- false;
+                    state <- FlashState::Transfer;
+                } else {
+                    flash_cs <- true;
+                }
+            },
+            FlashState::Transfer => {
+                tick <- !tick;
+
+                if tick {
+                    if !phase {
+                        phase <- true;
+                    } else {
+                        receive <- cat(receive[30:0], flash_miso);
+                        transmit <- cat(transmit[30:0], false);
+                        phase <- false;
+
+                        if count == 1 {
+                            if !stage {
+                                transmit <- 0;
+                                count <- 32;
+                                stage <- true;
+                            } else {
+                                state <- FlashState::Done;
+                            }
+                        } else {
+                            count <- count - 1;
+                        }
+                    }
+                }
+            },
+            FlashState::Done => {
+                flash_cs <- true;
+                read_data <- receive;
+                ready <- true;
+                state <- FlashState::Idle;
+            }
+        }
+    }
+}
